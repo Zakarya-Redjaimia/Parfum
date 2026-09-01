@@ -1,3 +1,5 @@
 pywebio==1.8.4
 qrcode==8.2
 reportlab==5.0.1
+pillow==12.3.0
+reportlab==5.0.1
