@@ -11,16 +11,17 @@ from pywebio.output import (
 )
 from pywebio.platform.flask import wsgi_app
 
-# ReportLab imports for PDF generation
+# ReportLab imports for PDF invoice generation
 from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-# --- Constants & Global Configuration ---
-DB_NAME = "shop.db"
+# --- Constants & Configuration ---
+# Connect to universal_shop.sqlite from GitHub / local repo
+DB_NAME = os.getenv("DATABASE_PATH", "universal_shop.sqlite")
 PORT = int(os.environ.get("PORT", 8080))
-STORE_BRAND = "Luxury Impact Parfum RZ"
+STORE_BRAND = "Luxury Impact Parfume RZ"
 
 CURRENCIES = {
     "EUR (€)": {"symbol": "€", "rate_to_usd": 1.08},
@@ -31,7 +32,7 @@ CURRENCIES = {
 selected_currency = "EUR (€)"
 current_user = None
 
-# --- Database & Helper Functions ---
+# --- Database Management ---
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -41,16 +42,29 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
+    # Products table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             price REAL NOT NULL,
-            currency TEXT NOT NULL,
-            image TEXT
+            currency TEXT NOT NULL DEFAULT 'EUR (€)',
+            image TEXT,
+            accord_notes TEXT
         )
     """)
     
+    # Users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0
+        )
+    """)
+    
+    # Cart table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS cart (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,16 +72,8 @@ def init_db():
             name TEXT NOT NULL,
             price REAL NOT NULL,
             image TEXT,
-            quantity INTEGER NOT NULL
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            is_admin INTEGER DEFAULT 0
+            quantity INTEGER NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
     
@@ -79,9 +85,10 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Run DB Initialization on Startup
+# Initialize DB structure on startup
 init_db()
 
+# --- Helper Functions ---
 def convert_price(amount, from_curr, to_curr):
     if from_curr not in CURRENCIES or to_curr not in CURRENCIES:
         return amount
@@ -101,7 +108,7 @@ def get_image_source(img_str):
     return "https://via.placeholder.com/150"
 
 def render_header(title=""):
-    user_status = f"👤 {current_user['name']}" if current_user else "👤 غير مسجل"
+    user_status = f"👤 {current_user['name']} {'(Admin)' if current_user and current_user.get('is_admin') else ''}" if current_user else "👤 غير مسجل"
     put_html(f"""
         <div style="background-color: #1a202c; color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
             <div style="float: right; font-size: 13px; color: #a0aec0;">{user_status}</div>
@@ -113,11 +120,11 @@ def render_header(title=""):
 def render_footer():
     put_html("""
         <footer style="margin-top: 40px; text-align: center; color: #718096; font-size: 12px;">
-            <p>© Luxury Impact Parfum RZ. All rights reserved.</p>
+            <p>© Luxury Impact Parfume RZ. All rights reserved.</p>
         </footer>
     """)
 
-# --- Navigation & Main Views ---
+# --- Main Navigation ---
 def main_menu():
     clear()
     render_header("المتجر الرئيسي")
@@ -128,7 +135,8 @@ def main_menu():
     ]
     
     if current_user and current_user.get('is_admin'):
-        options.append({'label': '⚙️ لوحة التحكم (Admin)', 'value': 'admin', 'color': 'warning'})
+        options.append({'label': '➕ إضافة عطر جديد', 'value': 'add_product', 'color': 'success'})
+        options.append({'label': '⚙️ لوحة الإدارة والإعدادات', 'value': 'admin', 'color': 'warning'})
         
     if not current_user:
         options.append({'label': '🔑 تسجيل الدخول', 'value': 'login', 'color': 'success'})
@@ -140,12 +148,13 @@ def main_menu():
     
     if act == 'shop': user_shop()
     elif act == 'cart': view_cart()
+    elif act == 'add_product': add_product_page()
     elif act == 'admin': admin_dashboard()
     elif act == 'login': login_page()
     elif act == 'register': register_page()
     elif act == 'logout': logout_action()
 
-# --- Authentication Views ---
+# --- User Auth ---
 def register_page():
     clear()
     render_header("إنشاء حساب جديد")
@@ -170,7 +179,7 @@ def register_page():
         conn.commit()
         toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
     except sqlite3.IntegrityError:
-        toast("اسم المستخدم مستخدم بالفعل، اختر اسماً آخر.", color="error")
+        toast("اسم المستخدم مستخدم بالفعل.", color="error")
     finally:
         conn.close()
         
@@ -207,25 +216,25 @@ def logout_action():
     toast("تم تسجيل الخروج بنجاح.", color="info")
     main_menu()
 
-# --- Store & Cart Operations ---
+# --- Store & Shopping Cart ---
 def user_shop():
     clear()
-    render_header("كتالوج العطور")
+    render_header("كتالوج العطور المتاحة")
     
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products")
+    cursor.execute("SELECT id, name, price, currency, image, accord_notes FROM products")
     products = cursor.fetchall()
     conn.close()
 
     curr_info = CURRENCIES[selected_currency]
 
     if not products:
-        put_html("<div style='background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: 20px auto; text-align: center; font-weight: 900;'><h3>لا توجد عطور متاحة حالياً.</h3></div>")
+        put_html("<div style='background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: 20px auto; text-align: center;'><h3>لا توجد عطور متاحة حالياً.</h3></div>")
     else:
-        table_data = [["الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
+        table_data = [["الصورة", "اسم العطر", "النوتات / المكونات", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
         for prod in products:
-            p_id, name, base_price, item_currency, img_path = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
+            p_id, name, base_price, item_currency, img_path, notes = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image'], prod['accord_notes']
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
@@ -233,6 +242,7 @@ def user_shop():
             table_data.append([
                 put_html(img_html),
                 name,
+                notes or "نوتات فاخرة متناغمة",
                 f"{disp_price:.2f} {curr_info['symbol']}",
                 put_buttons([{'label': '➕ إضافة للسلة', 'value': p_id, 'color': 'success'}],
                             onclick=lambda val: add_to_cart(val))
@@ -294,7 +304,7 @@ def view_cart():
 
     if not items:
         put_html("""
-            <div style="background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center; max-width: 600px; font-weight: 900;">
+            <div style="background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center; max-width: 600px;">
                 <h3>🛒 سلة التسوق فارغة حالياً.</h3>
             </div>
         """)
@@ -321,8 +331,8 @@ def view_cart():
         put_table(table_data)
         
         put_html(f"""
-            <div style="background: #ffffff; padding: 20px; border-radius: 12px; margin: 20px auto; max-width: 400px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); text-align: center; font-weight: 900;">
-                <h3 style="margin: 0; color: #1a202c; font-weight: 900; font-size: 22px;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:.2f} {curr_info['symbol']}</span></h3>
+            <div style="background: #ffffff; padding: 20px; border-radius: 12px; margin: 20px auto; max-width: 400px; text-align: center;">
+                <h3 style="margin: 0; color: #1a202c; font-size: 22px;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:.2f} {curr_info['symbol']}</span></h3>
             </div>
         """)
 
@@ -425,7 +435,7 @@ def generate_pdf_invoice():
 
     story.append(t)
     story.append(Spacer(1, 20))
-    story.append(Paragraph("Thank you for choosing Luxury Impact Parfum RZ!", normal_style))
+    story.append(Paragraph("Thank you for choosing Luxury Impact Parfume RZ!", normal_style))
 
     doc.build(story)
     pdf_data = buffer.getvalue()
@@ -434,31 +444,41 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", pdf_data)
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Admin Dashboard ---
+# --- Administration ---
 def admin_dashboard():
     clear()
-    render_header("لوحة التحكم وإدارة العطور")
+    render_header("لوحة الإدارة والإعدادات")
     
-    put_html("<h2 style='color: #1a202c; text-align: center; font-weight: 900; font-size: 24px;'>⚙️ لوحة إدارة المتجر</h2>")
-    
-    choice = actions("اختر العملية المطلوبة:", [
+    choice = actions("اختر الإجراء المطلوب:", [
         {'label': '➕ إضافة عطر جديد', 'value': 'add', 'color': 'success'},
-        {'label': '📋 عرض وتعديل قائمة العطور', 'value': 'list', 'color': 'primary'},
+        {'label': '📋 تعديل وقائمة العطور', 'value': 'list', 'color': 'primary'},
+        {'label': '⚙️ إعدادات العملة', 'value': 'settings', 'color': 'warning'},
         {'label': '🔙 العودة للقائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
     ])
     
     if choice == 'add': add_product_page()
     elif choice == 'list': list_products_page()
+    elif choice == 'settings': settings_page()
     elif choice == 'home': main_menu()
+
+def settings_page():
+    clear()
+    render_header("إعدادات العملة")
+    global selected_currency
+    curr_choice = select("اختر العملة الافتراضية:", list(CURRENCIES.keys()), value=selected_currency)
+    selected_currency = curr_choice
+    toast(f"تم تغيير العملة إلى: {selected_currency}", color="success")
+    admin_dashboard()
 
 def add_product_page():
     clear()
     render_header("إضافة عطر جديد إلى المتجر")
     
-    data = input_group("إضافة عطر جديد", [
+    data = input_group("بيانات العطر الجديد", [
         input("اسم العطر", name="name", required=True),
+        input("النوتات العطرية / Accord Notes", name="accord_notes", placeholder="مثال: Oud, Amber, Vanilla"),
         input("السعر", name="price", type=NUMBER, required=True),
-        select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="EUR (€)"),
+        select("عملة الإدخال", list(CURRENCIES.keys()), name="currency", value="EUR (€)"),
         file_upload("صورة العطر", name="image", accept="image/*", required=True)
     ])
     
@@ -466,8 +486,8 @@ def add_product_page():
         
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
-                   (data['name'], float(data['price']), data['currency'], image_str))
+    cursor.execute("INSERT INTO products (name, price, currency, image, accord_notes) VALUES (?, ?, ?, ?, ?)",
+                   (data['name'], float(data['price']), data['currency'], image_str, data['accord_notes']))
     conn.commit()
     conn.close()
     
@@ -476,26 +496,24 @@ def add_product_page():
 
 def list_products_page():
     clear()
-    render_header("إدارة وتعديل العطور المسجلة")
+    render_header("إدارة وتعديل العطور")
     
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products")
+    cursor.execute("SELECT id, name, price, currency, image, accord_notes FROM products")
     products = cursor.fetchall()
     conn.close()
     
     curr_info = CURRENCIES[selected_currency]
 
     if not products:
-        put_html("<div style='background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: 20px auto; font-weight: 900;'><h3>لا توجد عطور متوفرة للتعديل.</h3></div>")
+        put_html("<div style='background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: 20px auto; text-align: center;'><h3>لا توجد عطور متوفرة للتعديل.</h3></div>")
     else:
-        table_data = [["المعرف", "الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
+        table_data = [["ID", "الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
         for prod in products:
             p_id, name, base_price, item_currency, img_path = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
-            
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
-            
             img_html = f'<img src="{img_src}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px;">'
             
             table_data.append([
@@ -504,73 +522,25 @@ def list_products_page():
                 name,
                 f"{disp_price:.2f} {curr_info['symbol']}",
                 put_buttons([
-                    {'label': '✏️ تعديل', 'value': 'edit', 'color': 'warning'},
                     {'label': '🗑️ حذف', 'value': 'del', 'color': 'danger'}
-                ], onclick=lambda btn, item_id=p_id: handle_product_action(btn, item_id))
+                ], onclick=lambda btn, item_id=p_id: delete_product(item_id))
             ])
             
         put_table(table_data)
 
-    act = actions("", [
-        {'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'}
-    ])
-    if act == 'admin':
-        admin_dashboard()
-        return
+    act = actions("", [{'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'}])
+    if act == 'admin': admin_dashboard()
 
-    render_footer()
-
-def handle_product_action(action, p_id):
-    if action == 'del':
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
-        conn.commit()
-        conn.close()
-        toast("تم حذف العطر بنجاح.", color="info")
-        list_products_page()
-    elif action == 'edit':
-        edit_product_page(p_id)
-
-def edit_product_page(product_id):
-    clear()
-    render_header("تعديل بيانات العطر")
-    
+def delete_product(p_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
-    product = cursor.fetchone()
-    conn.close()
-    
-    if not product:
-        toast("العطر غير موجود!", color="error")
-        list_products_page()
-        return
-
-    p_name, p_price, p_currency, p_image = product['name'], product['price'], product['currency'], product['image']
-
-    data = input_group("تعديل العطر", [
-        input("اسم العطر", name="name", value=p_name, required=True),
-        input("السعر", name="price", type=NUMBER, value=float(p_price), required=True),
-        select("عملة السعر المسجلة", list(CURRENCIES.keys()), name="currency", value=p_currency),
-        file_upload("تحديث صورة العطر (اختياري)", name="image", accept="image/*")
-    ])
-    
-    image_str = p_image
-    if data['image'] and data['image'].get('content'):
-        image_str = process_and_save_image(data['image'])
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
-                   (data['name'], float(data['price']), data['currency'], image_str, product_id))
+    cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
     conn.commit()
     conn.close()
-    
-    toast("تم تحديث بيانات العطر بنجاح!", color="success")
+    toast("تم حذف العطر بنجاح.", color="info")
     list_products_page()
 
-# --- WSGI App Setup (Flask wrapper for Gunicorn) ---
+# --- WSGI Wrapper for Gunicorn Deployment ---
 app = wsgi_app(main_menu)
 
 if __name__ == '__main__':
