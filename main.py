@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import base64
-import threading
 from io import BytesIO
 
 # PyWebIO imports
@@ -10,22 +9,13 @@ from pywebio.input import input, input_group, select, file_upload, NUMBER, actio
 from pywebio.output import (
     put_html, put_table, put_buttons, toast, clear, download
 )
-from pywebio.platform.wsgi import wsgi_app
+from pywebio.platform.wsgi_app import wsgi_app
 
 # ReportLab imports for PDF generation
 from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-
-# Kivy imports (optional in server environment)
-try:
-    from kivy.app import App
-    from kivy.uix.boxlayout import BoxLayout
-    from kivy.uix.label import Label
-    KIVY_AVAILABLE = True
-except ImportError:
-    KIVY_AVAILABLE = False
 
 # --- Constants & Global Configuration ---
 DB_NAME = "shop.db"
@@ -41,12 +31,11 @@ CURRENCIES = {
 selected_currency = "EUR (€)"
 current_user = None
 
-# --- Helper & Utility Functions ---
+# --- Database & Helper Functions ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Products Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,7 +46,6 @@ def init_db():
         )
     """)
     
-    # Cart Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS cart (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +57,6 @@ def init_db():
         )
     """)
     
-    # Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,7 +66,6 @@ def init_db():
         )
     """)
     
-    # Insert default admin if not existing
     cursor.execute("SELECT * FROM users WHERE username = 'admin'")
     if not cursor.fetchone():
         cursor.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin', 'admin123', 1)")
@@ -87,7 +73,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Initialize DB on script load
+# Initialize Database
 init_db()
 
 def convert_price(amount, from_curr, to_curr):
@@ -541,27 +527,9 @@ def edit_product_page(product_id):
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- WSGI App Export for Render / Gunicorn ---
+# --- WSGI Export (for Gunicorn / Render Deployment) ---
 app = wsgi_app(main_menu)
 
-# Local Development / Kivy Entry Point
+# --- Direct Python Execution (Local Development) ---
 if __name__ == '__main__':
-    if KIVY_AVAILABLE:
-        def run_server():
-            start_server(main_menu, port=PORT, auto_open_webbrowser=False)
-
-        class ZakiShopApp(App):
-            def build(self):
-                threading.Thread(target=run_server, daemon=True).start()
-                layout = BoxLayout(orientation='vertical')
-                try:
-                    from kivy.uix.webview import WebView
-                    wb = WebView(url=f"http://127.0.0.1:{PORT}")
-                    layout.add_widget(wb)
-                except Exception:
-                    layout.add_widget(Label(text=f"Server running at http://127.0.0.1:{PORT}"))
-                return layout
-
-        ZakiShopApp().run()
-    else:
-        start_server(main_menu, port=PORT, debug=True)
+    start_server(main_menu, port=PORT, debug=True)
