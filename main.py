@@ -9,9 +9,7 @@ from pywebio.input import input, input_group, select, file_upload, NUMBER, actio
 from pywebio.output import (
     put_html, put_table, put_buttons, toast, clear, download
 )
-# ✅ CORRECT (Flask WSGI deployment)
 from pywebio.platform.flask import wsgi_app
-from pywebio.output import put_text
 
 # ReportLab imports for PDF generation
 from reportlab.lib.pagesizes import A5
@@ -34,8 +32,13 @@ selected_currency = "EUR (€)"
 current_user = None
 
 # --- Database & Helper Functions ---
-def init_db():
+def get_db_connection():
     conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute("""
@@ -68,6 +71,7 @@ def init_db():
         )
     """)
     
+    # Ensure default admin account exists
     cursor.execute("SELECT * FROM users WHERE username = 'admin'")
     if not cursor.fetchone():
         cursor.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin', 'admin123', 1)")
@@ -75,7 +79,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Initialize Database
+# Run DB Initialization on Startup
 init_db()
 
 def convert_price(amount, from_curr, to_curr):
@@ -97,8 +101,10 @@ def get_image_source(img_str):
     return "https://via.placeholder.com/150"
 
 def render_header(title=""):
+    user_status = f"👤 {current_user['name']}" if current_user else "👤 غير مسجل"
     put_html(f"""
         <div style="background-color: #1a202c; color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
+            <div style="float: right; font-size: 13px; color: #a0aec0;">{user_status}</div>
             <h1 style="margin: 0; font-size: 24px;">{STORE_BRAND}</h1>
             <p style="margin: 5px 0 0 0; color: #cbd5e0;">{title}</p>
         </div>
@@ -111,7 +117,7 @@ def render_footer():
         </footer>
     """)
 
-# --- View & Page Flow ---
+# --- Navigation & Main Views ---
 def main_menu():
     clear()
     render_header("المتجر الرئيسي")
@@ -126,6 +132,7 @@ def main_menu():
         
     if not current_user:
         options.append({'label': '🔑 تسجيل الدخول', 'value': 'login', 'color': 'success'})
+        options.append({'label': '📝 إنشاء حساب جديد', 'value': 'register', 'color': 'secondary'})
     else:
         options.append({'label': '🚪 تسجيل الخروج', 'value': 'logout', 'color': 'danger'})
 
@@ -135,7 +142,39 @@ def main_menu():
     elif act == 'cart': view_cart()
     elif act == 'admin': admin_dashboard()
     elif act == 'login': login_page()
+    elif act == 'register': register_page()
     elif act == 'logout': logout_action()
+
+# --- Authentication Views ---
+def register_page():
+    clear()
+    render_header("إنشاء حساب جديد")
+    
+    data = input_group("تسجيل حساب جديد", [
+        input("اسم المستخدم", name="username", required=True),
+        input("كلمة المرور", name="password", type="password", required=True),
+        input("تأكيد كلمة المرور", name="confirm_password", type="password", required=True)
+    ])
+    
+    if data['password'] != data['confirm_password']:
+        toast("كلمتا المرور غير متطابقتين!", color="error")
+        main_menu()
+        return
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)",
+                       (data['username'], data['password']))
+        conn.commit()
+        toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
+    except sqlite3.IntegrityError:
+        toast("اسم المستخدم مستخدم بالفعل، اختر اسماً آخر.", color="error")
+    finally:
+        conn.close()
+        
+    main_menu()
 
 def login_page():
     clear()
@@ -146,7 +185,7 @@ def login_page():
         input("كلمة المرور", name="password", type="password", required=True)
     ])
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, username, is_admin FROM users WHERE username = ? AND password = ?", 
                    (data['username'], data['password']))
@@ -155,11 +194,11 @@ def login_page():
     
     global current_user
     if user:
-        current_user = {'id': user[0], 'name': user[1], 'is_admin': bool(user[2])}
-        toast(f"مرحباً بك {user[1]}!", color="success")
+        current_user = {'id': user['id'], 'name': user['username'], 'is_admin': bool(user['is_admin'])}
+        toast(f"مرحباً بك {user['username']}!", color="success")
         main_menu()
     else:
-        toast("خطأ في بيانات الدخول!", color="error")
+        toast("اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
         main_menu()
 
 def logout_action():
@@ -168,11 +207,12 @@ def logout_action():
     toast("تم تسجيل الخروج بنجاح.", color="info")
     main_menu()
 
+# --- Store & Cart Operations ---
 def user_shop():
     clear()
     render_header("كتالوج العطور")
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products")
     products = cursor.fetchall()
@@ -185,7 +225,7 @@ def user_shop():
     else:
         table_data = [["الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
         for prod in products:
-            p_id, name, base_price, item_currency, img_path = prod
+            p_id, name, base_price, item_currency, img_path = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
@@ -210,21 +250,21 @@ def add_to_cart(product_id):
         login_page()
         return
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
     product = cursor.fetchone()
     
     if product:
-        p_id, name, price_val, prod_currency, image = product
+        name, price_val, prod_currency, image = product['name'], product['price'], product['currency'], product['image']
         base_usd_price = convert_price(price_val, prod_currency, "USD ($)")
             
         cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND name = ?", (current_user['id'], name))
         existing_item = cursor.fetchone()
         
         if existing_item:
-            new_qty = existing_item[1] + 1
-            cursor.execute("UPDATE cart SET quantity = ? WHERE id = ?", (new_qty, existing_item[0]))
+            new_qty = existing_item['quantity'] + 1
+            cursor.execute("UPDATE cart SET quantity = ? WHERE id = ?", (new_qty, existing_item['id']))
         else:
             cursor.execute("INSERT INTO cart (user_id, name, price, image, quantity) VALUES (?, ?, ?, ?, ?)",
                            (current_user['id'], name, base_usd_price, image, 1))
@@ -244,7 +284,7 @@ def view_cart():
         login_page()
         return
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, quantity, image FROM cart WHERE user_id = ?", (current_user['id'],))
     items = cursor.fetchall()
@@ -263,7 +303,7 @@ def view_cart():
         grand_total = 0.0
 
         for item in items:
-            c_id, name, base_usd_price, quantity, img_path = item
+            name, base_usd_price, quantity, img_path = item['name'], item['price'], item['quantity'], item['image']
             converted_price = convert_price(base_usd_price, "USD ($)", selected_currency)
             total = converted_price * quantity
             grand_total += total
@@ -302,7 +342,7 @@ def view_cart():
 
 def empty_user_cart():
     if current_user:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
         conn.commit()
@@ -314,7 +354,7 @@ def generate_pdf_invoice():
     if not current_user:
         return
         
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT name, price, quantity FROM cart WHERE user_id = ?", (current_user['id'],))
     items = cursor.fetchall()
@@ -362,7 +402,7 @@ def generate_pdf_invoice():
     grand_total = 0.0
 
     for item in items:
-        name, base_usd_price, qty = item
+        name, base_usd_price, qty = item['name'], item['price'], item['quantity']
         price = convert_price(base_usd_price, "USD ($)", selected_currency)
         total = price * qty
         grand_total += total
@@ -394,6 +434,7 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", pdf_data)
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
+# --- Admin Dashboard ---
 def admin_dashboard():
     clear()
     render_header("لوحة التحكم وإدارة العطور")
@@ -423,7 +464,7 @@ def add_product_page():
     
     image_str = process_and_save_image(data['image'])
         
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
                    (data['name'], float(data['price']), data['currency'], image_str))
@@ -437,7 +478,7 @@ def list_products_page():
     clear()
     render_header("إدارة وتعديل العطور المسجلة")
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products")
     products = cursor.fetchall()
@@ -450,7 +491,7 @@ def list_products_page():
     else:
         table_data = [["المعرف", "الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
         for prod in products:
-            p_id, name, base_price, item_currency, img_path = prod
+            p_id, name, base_price, item_currency, img_path = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
             
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
@@ -481,7 +522,7 @@ def list_products_page():
 
 def handle_product_action(action, p_id):
     if action == 'del':
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
         conn.commit()
@@ -495,7 +536,7 @@ def edit_product_page(product_id):
     clear()
     render_header("تعديل بيانات العطر")
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
     product = cursor.fetchone()
@@ -506,7 +547,7 @@ def edit_product_page(product_id):
         list_products_page()
         return
 
-    _, p_name, p_price, p_currency, p_image = product
+    p_name, p_price, p_currency, p_image = product['name'], product['price'], product['currency'], product['image']
 
     data = input_group("تعديل العطر", [
         input("اسم العطر", name="name", value=p_name, required=True),
@@ -519,7 +560,7 @@ def edit_product_page(product_id):
     if data['image'] and data['image'].get('content'):
         image_str = process_and_save_image(data['image'])
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
                    (data['name'], float(data['price']), data['currency'], image_str, product_id))
@@ -529,9 +570,8 @@ def edit_product_page(product_id):
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- WSGI Export (for Gunicorn / Render Deployment) ---
+# --- WSGI App Setup (Flask wrapper for Gunicorn) ---
 app = wsgi_app(main_menu)
 
-# --- Direct Python Execution (Local Development) ---
 if __name__ == '__main__':
     start_server(main_menu, port=PORT, debug=True)
