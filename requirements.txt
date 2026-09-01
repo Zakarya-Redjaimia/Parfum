@@ -8,3 +8,5 @@ tornado
 ua-parser
 user-agents
 gunicorn
+flask
+werkzeug
