@@ -9,7 +9,9 @@ from pywebio.input import input, input_group, select, file_upload, NUMBER, actio
 from pywebio.output import (
     put_html, put_table, put_buttons, toast, clear, download
 )
-from pywebio.platform.wsgi import wsgi_app
+# ✅ CORRECT (Flask WSGI deployment)
+from pywebio.platform.flask import wsgi_app
+from pywebio.output import put_text
 
 # ReportLab imports for PDF generation
 from reportlab.lib.pagesizes import A5
