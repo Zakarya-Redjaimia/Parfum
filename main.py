@@ -11,7 +11,7 @@ from io import BytesIO
 import qrcode
 from flask import Flask
 from pywebio import start_server
-from pywebio.platform.flask import wsgi_app
+from pywebio.platform.flask import webio_view
 from pywebio.input import input, PASSWORD, file_upload, input_group, actions, NUMBER, select
 from pywebio.output import (
     put_html, put_table, put_buttons, put_column, put_row, 
@@ -242,7 +242,7 @@ def render_footer():
 
 # --- Authentication & Navigation Views ---
 def main_menu():
-    global current_user  # Declared at top of scope to fix SyntaxError
+    global current_user
     clear()
     render_header("الصفحة الرئيسية والخدمات")
     
@@ -715,9 +715,11 @@ def edit_product_page(product_id):
 
 # --- Flask & WSGI Application Bindings ---
 flask_app = Flask(__name__)
-flask_app.add_url_rule('/', 'webio_view', wsgi_app(main_menu), methods=['GET', 'POST', 'OPTIONS'])
 
-# WSGI entry point for hosting providers (Render, Gunicorn, etc.)
+# Register PyWebIO application via webio_view route rule
+flask_app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
+
+# WSGI entry points for deployment platforms (Render, Gunicorn, etc.)
 app = flask_app
 
 def open_browser():
