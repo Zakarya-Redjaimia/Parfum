@@ -242,6 +242,7 @@ def render_footer():
 
 # --- Authentication & Navigation Views ---
 def main_menu():
+    global current_user  # Declared at top of scope to fix SyntaxError
     clear()
     render_header("الصفحة الرئيسية والخدمات")
     
@@ -269,7 +270,6 @@ def main_menu():
     elif choice == 'admin': admin_dashboard()
     elif choice == 'login': login_page()
     elif choice == 'logout': 
-        global current_user
         current_user = None
         toast("تم تسجيل الخروج بنجاح.", color="info")
         main_menu()
