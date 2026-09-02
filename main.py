@@ -509,6 +509,299 @@ def add_to_cart(product_id, quantity):
     if not current_user:
         toast("يرجى تسجيل الدخول أولاً!", color="warning")
         login_page()
+ import sqlite3
+import os
+import base64
+import time
+import threading
+import webbrowser
+from io import BytesIO
+
+from flask import Flask
+from pywebio import start_server, config
+from pywebio.input import input, select, file_upload, NUMBER, PASSWORD, input_group
+from pywebio.output import (
+    put_html, put_table, put_buttons, clear, toast, download, 
+    actions, put_text, put_row, put_column
+)
+from pywebio.platform.flask import wsgi_app
+
+from reportlab.lib.pagesizes import A5
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+# --- Application Configurations & Constants ---
+
+DB_NAME = "parfum_rz.db"
+STORE_BRAND = "Luxury Impact Parfum RZ"
+PORT = 8080
+IMAGE_DIR = "static/images"
+
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
+CURRENCIES = {
+    "USD ($)": {"symbol": "$", "rate": 1.0},
+    "EUR (€)": {"symbol": "€", "rate": 0.92},
+    "DZD (DA)": {"symbol": "DA", "rate": 134.50},
+    "GBP (£)": {"symbol": "£", "rate": 0.79}
+}
+
+current_user = None  # Global session state: {"id": int, "name": str, "role": str}
+selected_currency = "EUR (€)"
+
+# --- Database & Helper Utilities ---
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Products table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            price REAL NOT NULL,
+            currency TEXT NOT NULL,
+            image TEXT NOT NULL
+        )
+    """)
+    
+    # Users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user'
+        )
+    """)
+    
+    # Cart table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cart (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            price REAL NOT NULL,
+            image TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    
+    # Seed default admin account if none exists
+    cursor.execute("SELECT * FROM users WHERE role = 'admin'")
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)",
+                       ("Administrator", "admin", "admin123", "admin"))
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def convert_price(amount, from_curr, to_curr):
+    """Converts price values between supported currencies via USD base rate."""
+    if from_curr not in CURRENCIES or to_curr not in CURRENCIES:
+        return amount
+    usd_amount = amount / CURRENCIES[from_curr]['rate']
+    return usd_amount * CURRENCIES[to_curr]['rate']
+
+def process_and_save_image(file_obj):
+    """Saves uploaded images locally or converts to base64 string."""
+    if not file_obj or not file_obj.get('content'):
+        return "placeholder.png"
+    
+    filename = f"{int(time.time())}_{file_obj['filename']}"
+    filepath = os.path.join(IMAGE_DIR, filename)
+    
+    with open(filepath, 'wb') as f:
+        f.write(file_obj['content'])
+        
+    return filepath
+
+def get_image_source(img_path):
+    """Returns valid image source path or fallback base64 string for HTML rendering."""
+    if os.path.exists(img_path):
+        with open(img_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode('utf-8')
+            return f"data:image/jpeg;base64,{encoded}"
+    # Default visual fallback SVG
+    return "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='70' height='70' viewBox='0 0 70 70'><rect width='70' height='70' fill='%23edf2f7'/><text x='50%' y='50%' fill='%23a0aec0' dominant-baseline='middle' text-anchor='middle' font-family='sans-serif' font-size='10'>No Image</text></svg>"
+
+# --- UI Header & Footer Layouts ---
+
+def render_header(subtitle=""):
+    user_status = f"👤 {current_user['name']} ({current_user['role'].upper()})" if current_user else "🔑 غير مسجل"
+    
+    put_html(f"""
+        <div style="background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); padding: 25px; border-radius: 12px; margin-bottom: 25px; text-align: center; color: white; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
+            <h1 style="margin: 0; font-family: 'Helvetica Neue', Arial, sans-serif; font-weight: 900; letter-spacing: 1px; color: #f7fafc; font-size: 32px;">{STORE_BRAND}</h1>
+            <p style="margin: 5px 0 0 0; color: #cbd5e0; font-weight: 500; font-size: 16px;">{subtitle}</p>
+            <div style="margin-top: 15px; font-size: 14px; background: rgba(255,255,255,0.1); display: inline-block; padding: 6px 16px; border-radius: 20px;">
+                {user_status} | 🌐 العملة الحالية: <b>{selected_currency}</b>
+            </div>
+        </div>
+    """)
+
+def render_footer():
+    put_html("""
+        <hr style="border: 0; height: 1px; background: #e2e8f0; margin: 40px 0 20px 0;">
+        <div style="text-align: center; color: #718096; font-size: 13px; font-weight: 600; padding-bottom: 20px;">
+            &copy; Luxury Impact Parfum RZ. جميع الحقوق محفوظة.
+        </div>
+    """)
+
+# --- Authentication & Main Views ---
+
+def main_menu():
+    clear()
+    render_header("الصفحة الرئيسية والخدمات")
+    
+    put_html("<h2 style='text-align: center; color: #2d3748; font-weight: 900;'>مرحباً بكم في متجرنا الرقمي</h2>")
+    
+    opts = [
+        {'label': '🛍️ تصفح العطور', 'value': 'shop', 'color': 'primary'},
+        {'label': '🛒 عرض سلة التسوق', 'value': 'cart', 'color': 'info'},
+        {'label': '💱 تغيير العملة', 'value': 'currency', 'color': 'warning'},
+    ]
+    
+    if current_user and current_user['role'] == 'admin':
+        opts.append({'label': '⚙️ لوحة التحكم (Admin)', 'value': 'admin', 'color': 'danger'})
+        
+    if current_user:
+        opts.append({'label': '🚪 تسجيل الخروج', 'value': 'logout', 'color': 'secondary'})
+    else:
+        opts.append({'label': '🔑 تسجيل الدخول / إنشاء حساب', 'value': 'login', 'color': 'success'})
+
+    choice = actions("اختر وجهتك:", opts)
+    
+    if choice == 'shop': user_shop()
+    elif choice == 'cart': view_cart()
+    elif choice == 'currency': change_currency_page()
+    elif choice == 'admin': admin_dashboard()
+    elif choice == 'login': login_page()
+    elif choice == 'logout': 
+        global current_user
+        current_user = None
+        toast("تم تسجيل الخروج بنجاح.", color="info")
+        main_menu()
+
+def login_page():
+    clear()
+    render_header("تسجيل الدخول أو حساب جديد")
+    
+    mode = actions("يرجى تحديد الخيار:", [
+        {'label': 'تسجيل الدخول', 'value': 'login', 'color': 'primary'},
+        {'label': 'إنشاء حساب جديد', 'value': 'register', 'color': 'success'},
+        {'label': 'العودة', 'value': 'back', 'color': 'secondary'}
+    ])
+    
+    if mode == 'back': main_menu(); return
+    
+    if mode == 'login':
+        data = input_group("تسجيل الدخول", [
+            input("اسم المستخدم", name="username", required=True),
+            input("كلمة المرور", name="password", type=PASSWORD, required=True)
+        ])
+        
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, role FROM users WHERE username = ? AND password = ?", 
+                       (data['username'], data['password']))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if user:
+            global current_user
+            current_user = {'id': user[0], 'name': user[1], 'role': user[2]}
+            toast(f"مرحباً بعودتك، {current_user['name']}!", color="success")
+            main_menu()
+        else:
+            toast("بيانات الدخول غير صحيحة!", color="error")
+            login_page()
+            
+    elif mode == 'register':
+        data = input_group("إنشاء حساب جديد", [
+            input("الاسم الكامل", name="name", required=True),
+            input("اسم المستخدم", name="username", required=True),
+            input("كلمة المرور", name="password", type=PASSWORD, required=True)
+        ])
+        
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, 'user')",
+                           (data['name'], data['username'], data['password']))
+            conn.commit()
+            conn.close()
+            toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
+            login_page()
+        except sqlite3.IntegrityError:
+            toast("اسم المستخدم مستخدم بالفعل. اختر اسماً آخر.", color="error")
+            login_page()
+
+def change_currency_page():
+    global selected_currency
+    clear()
+    render_header("إعدادات العملة")
+    
+    curr = select("اختر العملة المفضلة لعرض الأسعار:", list(CURRENCIES.keys()), value=selected_currency)
+    selected_currency = curr
+    toast(f"تم تغيير العملة إلى {selected_currency}", color="success")
+    main_menu()
+
+# --- Storefront & Cart Management ---
+
+def user_shop():
+    clear()
+    render_header("كتالوج العطور الفاخرة")
+    
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, price, currency, image FROM products")
+    products = cursor.fetchall()
+    conn.close()
+    
+    curr_info = CURRENCIES[selected_currency]
+    
+    if not products:
+        put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 20px auto; text-align: center; max-width: 600px; font-weight: 900;'><h3>لا توجد عطور متوفرة حالياً في المتجر.</h3></div>")
+    else:
+        cards = []
+        for prod in products:
+            p_id, name, base_price, item_currency, img_path = prod
+            disp_price = convert_price(base_price, item_currency, selected_currency)
+            img_src = get_image_source(img_path)
+            
+            card_html = f"""
+                <div style="background: white; border-radius: 12px; padding: 15px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); text-align: center; border: 1px solid #e2e8f0;">
+                    <img src="{img_src}" style="width: 100%; height: 180px; object-fit: cover; border-radius: 8px;">
+                    <h3 style="margin: 10px 0 5px 0; color: #1a202c; font-size: 18px; font-weight: 800;">{name}</h3>
+                    <p style="color: #38a169; font-weight: 900; font-size: 16px; margin: 0 0 10px 0;">{disp_price:.2f} {curr_info['symbol']}</p>
+                </div>
+            """
+            
+            btn = put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}], 
+                              onclick=lambda pid=p_id: add_to_cart_action(pid))
+            cards.append(put_column([put_html(card_html), btn]))
+            
+        put_row(cards, size='280px 20px')
+        
+    act = actions("", [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}])
+    if act == 'home': main_menu()
+
+def add_to_cart_action(product_id):
+    if not current_user:
+        toast("يرجى تسجيل الدخول أولاً لإضافة العطور إلى سلتك.", color="warning")
+        login_page()
+        return
+        
+    qty = input("الكمية المطلوب إضافتها:", type=NUMBER, value=1)
+    if not qty or qty < 1:
+        toast("الكمية غير صحيحة!", color="error")
         return
         
     conn = sqlite3.connect(DB_NAME)
@@ -524,14 +817,14 @@ def add_to_cart(product_id, quantity):
         existing_item = cursor.fetchone()
         
         if existing_item:
-            new_qty = existing_item[1] + quantity
+            new_qty = existing_item[1] + qty
             cursor.execute("UPDATE cart SET quantity = ? WHERE id = ?", (new_qty, existing_item[0]))
         else:
             cursor.execute("INSERT INTO cart (user_id, name, price, image, quantity) VALUES (?, ?, ?, ?, ?)",
-                           (current_user['id'], name, base_usd_price, image, quantity))
+                           (current_user['id'], name, base_usd_price, image, qty))
                            
         conn.commit()
-        toast(f"تم إضافة {quantity} من '{name}' إلى السلة بنجاح!", color="success")
+        toast(f"تم إضافة {qty} من '{name}' إلى السلة بنجاح!", color="success")
     
     conn.close()
     view_cart()
