@@ -580,16 +580,16 @@ pywebio_application = wsgi_app(pywebio_main_entry)
 
 # Combine Flask and PyWebIO using Werkzeug DispatcherMiddleware
 # Mount PyWebIO as root UI '/', retain Flask REST API endpoints at '/flask_native'
-flask_app.wsgi_app = DispatcherMiddleware(
+application = DispatcherMiddleware(
     pywebio_application,
     {
         '/flask_native': flask_app
     }
 )
 
-# Export WSGI entry point attributes for Gunicorn startup commands
-app = flask_app.wsgi_app
-
+# Expose WSGI targets
+app = application
+flask_app.wsgi_app = application
 # ==============================================================================
 # SECTION 8: CLI LOCAL DEVELOPMENT EXECUTION
 # ==============================================================================
