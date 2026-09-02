@@ -509,7 +509,7 @@ def add_to_cart(product_id, quantity):
     if not current_user:
         toast("يرجى تسجيل الدخول أولاً!", color="warning")
         login_page()
- import sqlite3
+import sqlite3
 import os
 import base64
 import time
