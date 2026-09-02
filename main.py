@@ -245,6 +245,30 @@ def db_fetch_logs() -> List[Dict[str, Any]]:
     conn.close()
     return [dict(row) for row in rows]
 
+def db_fetch_users() -> List[Dict[str, Any]]:
+    conn = get_db_connection()
+    rows = conn.execute("SELECT id, username, email, role, created_at FROM users ORDER BY id DESC").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def db_create_user(username: str, email: str, password: str, role: str = 'user') -> Tuple[bool, str]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        pwd_hash = generate_password_hash(password)
+        cursor.execute("INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                       (username, email, pwd_hash, role))
+        conn.commit()
+        conn.close()
+        log_event("USER_MANAGEMENT", f"User account created: {username} ({role})")
+        return True, "User account successfully created."
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, "Username or email already exists."
+    except Exception as e:
+        conn.close()
+        return False, str(e)
+
 # ==============================================================================
 # SECTION 4: FLASK REST API ENDPOINTS
 # ==============================================================================
@@ -520,13 +544,44 @@ def render_system_logs_view():
             
         put_table(rows, header=["Log ID", "Type", "Description", "IP Origin", "Timestamp"])
 
+def render_users_view():
+    """Renders user management view."""
+    clear("main_content")
+    with use_scope("main_content"):
+        put_markdown("### User Management")
+        put_button("Create New User", onclick=lambda: show_user_form_popup(), color="success")
+        put_html("<br>")
+        
+        users = db_fetch_users()
+        rows = [[u['id'], u['username'], u['email'], u['role'], u['created_at']] for u in users]
+        put_table(rows, header=["User ID", "Username", "Email", "Role", "Created At"])
+
+def show_user_form_popup():
+    """Modal dialog for user creation."""
+    popup("Create Account", [
+        put_markdown("**New User Credentials**"),
+        put_button("Close", onclick=lambda: close_popup(), color="secondary")
+    ])
+    
+    data = input_group("User Details", [
+        input("Username", name="username", required=True),
+        input("Email", name="email", required=True),
+        input("Password", name="password", type=PASSWORD, required=True),
+        select("Role", name="role", options=["user", "admin", "manager"], value="user")
+    ])
+    
+    close_popup()
+    ok, msg = db_create_user(data['username'], data['email'], data['password'], data['role'])
+    toast(msg, color="success" if ok else "error")
+    render_users_view()
+
 # ==============================================================================
 # SECTION 6: PYWEBIO APPLICATION ROUTER & ENTRY POINT
 # ==============================================================================
 
 def pywebio_main_entry():
     """Main Web Application UI handler invoked by WSGI wrapper."""
-    pywebio.session.set_render_heading(False)
+    pywebio.config(title="Enterprise Control Panel", theme="default")
     ui_header_component()
     
     # Navigation Control Bar
@@ -536,6 +591,7 @@ def pywebio_main_entry():
             {'label': 'Catalog Management', 'value': 'catalog', 'color': 'secondary'},
             {'label': 'New Order', 'value': 'new_order', 'color': 'success'},
             {'label': 'Order History', 'value': 'orders', 'color': 'info'},
+            {'label': 'User Management', 'value': 'users', 'color': 'warning'},
             {'label': 'Audit Logs', 'value': 'logs', 'color': 'dark'}
         ],
         onclick=lambda val: navigate_route(val)
@@ -557,6 +613,8 @@ def navigate_route(route_name: str):
         render_order_entry_view()
     elif route_name == 'orders':
         render_orders_list_view()
+    elif route_name == 'users':
+        render_users_view()
     elif route_name == 'logs':
         render_system_logs_view()
 
