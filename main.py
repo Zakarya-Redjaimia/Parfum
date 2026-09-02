@@ -3,19 +3,18 @@ import sys
 import json
 import sqlite3
 import datetime
-import functools
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 
 # Third-party dependencies
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, make_response
+from flask import Flask, request, jsonify, render_template_string
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 from werkzeug.security import generate_password_hash, check_password_hash
 
 import pywebio
 from pywebio.input import input, select, textarea, checkbox, actions, NUMBER, PASSWORD, TEXT
 from pywebio.output import (
-    put_text, put_markdown, put_header, put_table, put_buttons, put_button,
+    put_text, put_markdown, put_table, put_buttons, put_button,
     put_code, put_html, put_loading, put_row, put_column, clear, toast,
     popup, close_popup, use_scope, style
 )
@@ -201,7 +200,6 @@ def db_save_product(data: Dict[str, Any], product_id: Optional[int] = None) -> T
 
 def db_delete_product(product_id: int) -> bool:
     conn = get_db_connection()
-    conn.execute("SELECT * FROM products WHERE id = ?", (product_id,))
     conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
     conn.commit()
     conn.close()
@@ -308,7 +306,7 @@ def api_internal_error(e):
 # ==============================================================================
 
 def ui_header_component():
-    """Renders top navigation header across all PyWebIO views."""
+    """Renders top navigation header across all PyWebIO views using HTML/Markdown."""
     put_html("""
         <div style="background-color: #1e293b; padding: 15px 25px; border-radius: 8px; margin-bottom: 20px; color: white; display: flex; justify-content: space-between; align-items: center;">
             <h2 style="margin:0; font-family: sans-serif;">Enterprise Portal</h2>
@@ -431,10 +429,6 @@ def show_product_form_popup(product_id: Optional[int] = None):
         put_column([
             put_markdown(f"**{'Edit' if product_id else 'Create'} Product Record**"),
             put_button("Close", onclick=lambda: close_popup(), color="secondary")
-        ]),
-        put_html("<hr>"),
-        put_column([
-            # Inline creation using pywebio pin/input handles inside popups
         ])
     ])
     
@@ -577,9 +571,6 @@ def navigate_route(route_name: str):
     elif route_name == 'logs':
         render_system_logs_view()
 
-# Helper function wrap for PyWebIO input_group within execution frames
-from pywebio.input import input_group
-
 # ==============================================================================
 # SECTION 7: WSGI MIDDLEWARE DISPATCHER SETUP
 # ==============================================================================
@@ -588,7 +579,7 @@ from pywebio.input import input_group
 pywebio_application = wsgi_app(pywebio_main_entry)
 
 # Combine Flask and PyWebIO using Werkzeug DispatcherMiddleware
-# Mount PyWebIO as root UI '/', retain Flask REST API endpoints at '/api'
+# Mount PyWebIO as root UI '/', retain Flask REST API endpoints at '/flask_native'
 flask_app.wsgi_app = DispatcherMiddleware(
     pywebio_application,
     {
@@ -596,7 +587,7 @@ flask_app.wsgi_app = DispatcherMiddleware(
     }
 )
 
-# Crucial WSGI attribute reference bound for Gunicorn commands (e.g. main:flask_app or main:app)
+# Export WSGI entry point attributes for Gunicorn startup commands
 app = flask_app.wsgi_app
 
 # ==============================================================================
@@ -607,7 +598,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting development server on port {port}...")
     
-    # Run locally using PyWebIO built-in tornado/wsgi runner
+    # Run locally using PyWebIO built-in server runner
     pywebio.platform.start_server(
         pywebio_main_entry,
         port=port,
