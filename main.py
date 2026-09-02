@@ -7,18 +7,17 @@ import logging
 from typing import Dict, Any, List, Optional, Tuple
 
 # Third-party dependencies
-from flask import Flask, request, jsonify, render_template_string
-from werkzeug.middleware.dispatcher import DispatcherMiddleware
+from flask import Flask, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 
 import pywebio
-from pywebio.input import input, select, textarea, checkbox, actions, NUMBER, PASSWORD, TEXT
+from pywebio.input import input, select, textarea, checkbox, actions, input_group, NUMBER, PASSWORD, TEXT
 from pywebio.output import (
     put_text, put_markdown, put_table, put_buttons, put_button,
     put_code, put_html, put_loading, put_row, put_column, clear, toast,
     popup, close_popup, use_scope, style
 )
-from pywebio.platform.wsgi import wsgi_app
+from pywebio.platform.flask import webio_view
 
 # ==============================================================================
 # SECTION 1: LOGGING & CONFIGURATION
@@ -292,15 +291,6 @@ def api_get_logs():
     logs = db_fetch_logs()
     return jsonify({"success": True, "count": len(logs), "data": logs}), 200
 
-@flask_app.errorhandler(404)
-def api_not_found(e):
-    return jsonify({"error": "Resource not found", "path": request.path}), 404
-
-@flask_app.errorhandler(500)
-def api_internal_error(e):
-    logger.error(f"Server error: {e}")
-    return jsonify({"error": "Internal server processing fault"}), 500
-
 # ==============================================================================
 # SECTION 5: PYWEBIO UI COMPONENTS & VIEWS
 # ==============================================================================
@@ -432,7 +422,6 @@ def show_product_form_popup(product_id: Optional[int] = None):
         ])
     ])
     
-    # Execute form input within popup context
     form_data = input_group("Enter Product Details", [
         input("SKU Code", name="sku", value=existing_data.get('sku', ''), required=True),
         input("Product Name", name="name", value=existing_data.get('name', ''), required=True),
@@ -572,24 +561,20 @@ def navigate_route(route_name: str):
         render_system_logs_view()
 
 # ==============================================================================
-# SECTION 7: WSGI MIDDLEWARE DISPATCHER SETUP
+# SECTION 7: PYWEBIO & FLASK ROUTE INTEGRATION
 # ==============================================================================
 
-# Construct PyWebIO WSGI application instance
-pywebio_application = wsgi_app(pywebio_main_entry)
-
-# Combine Flask and PyWebIO using Werkzeug DispatcherMiddleware
-# Mount PyWebIO as root UI '/', retain Flask REST API endpoints at '/flask_native'
-application = DispatcherMiddleware(
-    pywebio_application,
-    {
-        '/flask_native': flask_app
-    }
+# Mount PyWebIO directly onto the Flask root route
+flask_app.add_url_rule(
+    '/', 
+    endpoint='webio_main', 
+    view_func=webio_view(pywebio_main_entry), 
+    methods=['GET', 'POST', 'OPTIONS']
 )
 
-# Expose WSGI targets
-app = application
-flask_app.wsgi_app = application
+# Export app targets for Gunicorn
+app = flask_app
+
 # ==============================================================================
 # SECTION 8: CLI LOCAL DEVELOPMENT EXECUTION
 # ==============================================================================
@@ -598,7 +583,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting development server on port {port}...")
     
-    # Run locally using PyWebIO built-in server runner
     pywebio.platform.start_server(
         pywebio_main_entry,
         port=port,
