@@ -7,7 +7,9 @@ import base64
 from io import BytesIO
 import threading
 import webbrowser
+from datetime import datetime
 
+import qrcode
 from flask import Flask, request
 from pywebio.platform.flask import webio_view
 from pywebio import start_server
@@ -20,7 +22,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 
 # --- Configuration & Constants ---
 
@@ -139,6 +141,23 @@ def get_image_source(img_path):
     if img_path and str(img_path).startswith("data:image"):
         return img_path
     return "https://via.placeholder.com/150?text=No+Image"
+
+def generate_qr_code_stream(data_text):
+    """Generates an in-memory PNG QR Code stream."""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=4,
+        border=2,
+    )
+    qr.add_data(data_text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    img_buffer = BytesIO()
+    img.save(img_buffer, format="PNG")
+    img_buffer.seek(0)
+    return img_buffer
 
 def render_header(subtitle=""):
     put_html(f"""
@@ -403,7 +422,7 @@ def view_cart():
         """)
 
     act = actions("الخيارات المتاحة:", [
-        {'label': '📄 تحميل الفاتورة (PDF)', 'value': 'pdf', 'color': 'success'},
+        {'label': '📄 تحميل الفاتورة + QR Code (PDF)', 'value': 'pdf', 'color': 'success'},
         {'label': '🗑️ تفريغ السلة', 'value': 'clear_cart', 'color': 'danger'},
         {'label': '🛍️ مواصلة التسوق', 'value': 'shop', 'color': 'primary'},
         {'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
@@ -464,11 +483,12 @@ def generate_pdf_invoice():
     story.append(Paragraph(f"<b>{STORE_BRAND}</b>", title_style))
     story.append(Spacer(1, 4))
     story.append(Paragraph("OFFICIAL INVOICE / RECEIPT", normal_style))
-    story.append(Spacer(1, 15))
+    story.append(Spacer(1, 10))
 
-    customer_info = f"Customer ID: {current_user['username']} | Currency: {pdf_symbol}"
+    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    customer_info = f"Customer ID: {current_user['username']} | Date: {timestamp_str} | Currency: {pdf_symbol}"
     story.append(Paragraph(customer_info, normal_style))
-    story.append(Spacer(1, 15))
+    story.append(Spacer(1, 10))
 
     data = [["Item Description", "Price", "Qty", "Total"]]
     grand_total = 0.0
@@ -481,7 +501,6 @@ def generate_pdf_invoice():
         total = price * qty
         grand_total += total
         
-        # Clean item name for Standard Helvetica encoding
         safe_item_name = name.encode('ascii', 'ignore').decode('ascii') or "Parfum Product"
         data.append([safe_item_name, f"{price:,.2f} {pdf_symbol}", str(qty), f"{total:,.2f} {pdf_symbol}"])
 
@@ -501,7 +520,23 @@ def generate_pdf_invoice():
     ]))
 
     story.append(t)
-    story.append(Spacer(1, 20))
+    story.append(Spacer(1, 15))
+
+    # --- Generate & Render QR Code ---
+    qr_payload = (
+        f"Brand: {STORE_BRAND}\n"
+        f"User: {current_user['username']}\n"
+        f"Total: {grand_total:,.2f} {pdf_symbol}\n"
+        f"Date: {timestamp_str}"
+    )
+    qr_stream = generate_qr_code_stream(qr_payload)
+    qr_image = RLImage(qr_stream, width=90, height=90)
+    qr_image.hAlign = 'CENTER'
+    
+    story.append(qr_image)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Scan QR Code to verify receipt authenticity", normal_style))
+    story.append(Spacer(1, 10))
     story.append(Paragraph("Thank you for choosing Luxury Impact Parfum RZ!", normal_style))
 
     doc.build(story)
@@ -509,7 +544,7 @@ def generate_pdf_invoice():
     buffer.close()
 
     download("Invoice_Parfum_RZ.pdf", pdf_data)
-    toast("تم تحميل الفاتورة بنجاح!", color="success")
+    toast("تم تحميل الفاتورة الموثقة بـ QR Code بنجاح!", color="success")
 
 # --- Admin Dashboard & Product Management ---
 
