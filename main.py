@@ -721,6 +721,9 @@ def open_browser():
     time.sleep(1.5)
     webbrowser.open(f"http://localhost:{PORT}")
 
+app = Flask(__name__)
+flask_app = app  # Exposes 'flask_app' for Gunicorn import
+
 if __name__ == '__main__':
     threading.Thread(target=open_browser, daemon=True).start()
     app.run(host='0.0.0.0', port=PORT, debug=True)
