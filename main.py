@@ -679,6 +679,9 @@ def open_browser():
 # Add this near the bottom of main.py
 flask_app = app
 
+# Place this directly in your app.py / main.py file after init_db definition:
+init_db()
+
+# Do NOT rely solely on if __name__ == '__main__': for init_db()
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=PORT)
