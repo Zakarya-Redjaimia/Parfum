@@ -25,8 +25,8 @@ from pywebio.output import put_html, put_table, put_buttons, clear, toast, downl
 DATA_DIR = os.environ.get("RENDER_DISK_PATH", os.path.join(os.getcwd(), "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DB_NAME = os.path.join(DATA_DIR, "shop_db.sqlite")
-UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
+DB_NAME = os.path.abspath(os.path.join(DATA_DIR, "shop_db.sqlite"))
+UPLOAD_DIR = os.path.abspath(os.path.join(DATA_DIR, "uploads"))
 PORT = int(os.environ.get("PORT", 8080))
 
 # Store Details
@@ -46,10 +46,15 @@ CURRENCIES = {
 selected_currency = "DZD (DA)"
 current_user = None
 
+def get_db_connection():
+    """Returns a thread-safe connection to the SQLite database."""
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=15)
+    return conn
+
 def init_db():
     """Initializes SQLite tables and applies necessary schema migrations."""
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Users Table
@@ -98,11 +103,15 @@ def process_and_save_image(file_data):
     if not file_data or not file_data.get('content'):
         return "https://via.placeholder.com/260x180?text=No+Image"
     
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     filename = f"img_{int(time.time())}_{file_data['filename']}"
-    save_path = os.path.join(UPLOAD_DIR, filename)
+    save_path = os.path.abspath(os.path.join(UPLOAD_DIR, filename))
     
-    with open(save_path, "wb") as f:
-        f.write(file_data['content'])
+    try:
+        with open(save_path, "wb") as f:
+            f.write(file_data['content'])
+    except Exception as e:
+        print(f"File write error: {e}")
         
     encoded = base64.b64encode(file_data['content']).decode('utf-8')
     mime_type = file_data.get('mime_type', 'image/jpeg')
@@ -114,11 +123,17 @@ def get_image_source(img_str):
         return "https://via.placeholder.com/260x180?text=No+Image"
     if img_str.startswith("data:image/") or img_str.startswith("http"):
         return img_str
-    if os.path.exists(img_str):
-        with open(img_str, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-            ext = os.path.splitext(img_str)[1].replace('.', '')
-            return f"data:image/{ext};base64,{encoded_string}"
+    
+    abs_path = os.path.abspath(img_str)
+    if os.path.exists(abs_path):
+        try:
+            with open(abs_path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                ext = os.path.splitext(abs_path)[1].replace('.', '')
+                return f"data:image/{ext};base64,{encoded_string}"
+        except Exception as e:
+            print(f"Error reading image path: {e}")
+            
     return "https://via.placeholder.com/260x180?text=No+Image"
 
 def convert_price(base_price, from_curr, to_curr):
@@ -387,23 +402,32 @@ def register_page():
         input("كلمة المرور", name="password", type=PASSWORD, required=True)
     ])
     
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE email = ?", (data['email'],))
-    if cursor.fetchone():
-        toast("البريد الإلكتروني مسجل بالفعل!", color="error")
-        conn.close()
-        register_page()
+    if not data or not data.get('email'):
+        main_menu()
         return
-        
+
     hashed_pwd = md5_hash(data['password'])
-    cursor.execute("INSERT INTO users (name, email, password) VALUES (?, ?, ?)",
-                   (data['name'], data['email'], hashed_pwd))
-    conn.commit()
-    conn.close()
-    
-    toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
-    login_page()
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE email = ?", (data['email'],))
+        if cursor.fetchone():
+            toast("البريد الإلكتروني مسجل بالفعل!", color="error")
+            conn.close()
+            register_page()
+            return
+            
+        cursor.execute("INSERT INTO users (name, email, password) VALUES (?, ?, ?)",
+                       (data['name'], data['email'], hashed_pwd))
+        conn.commit()
+        conn.close()
+        
+        toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
+        login_page()
+    except Exception as e:
+        toast(f"حدث خطأ أثناء إنشاء الحساب: {str(e)}", color="error")
+        main_menu()
 
 def login_page():
     clear()
@@ -414,8 +438,12 @@ def login_page():
         input("كلمة المرور", name="password", type=PASSWORD, required=True)
     ])
     
+    if not data or not data.get('email'):
+        main_menu()
+        return
+
     hashed_pwd = md5_hash(data['password'])
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, email FROM users WHERE email = ? AND password = ?", (data['email'], hashed_pwd))
     user = cursor.fetchone()
@@ -440,7 +468,7 @@ def user_shop():
     clear()
     render_header("تصفح مجموعة العطور الملكية والمتميزة")
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products")
     products = cursor.fetchall()
@@ -516,7 +544,7 @@ def add_to_cart(product_id, quantity):
         login_page()
         return
         
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
     product = cursor.fetchone()
@@ -550,7 +578,7 @@ def view_cart():
         login_page()
         return
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, quantity, image FROM cart WHERE user_id = ?", (current_user['id'],))
     items = cursor.fetchall()
@@ -608,7 +636,7 @@ def view_cart():
 
 def empty_user_cart():
     if current_user:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
         conn.commit()
@@ -620,7 +648,7 @@ def generate_pdf_invoice():
     if not current_user:
         return
         
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT name, price, quantity FROM cart WHERE user_id = ?", (current_user['id'],))
     items = cursor.fetchall()
@@ -729,9 +757,13 @@ def add_product_page():
         file_upload("صورة العطر", name="image", accept="image/*", required=True)
     ])
     
+    if not data or not data.get('name'):
+        admin_dashboard()
+        return
+
     image_str = process_and_save_image(data['image'])
         
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
                    (data['name'], float(data['price']), data['currency'], image_str))
@@ -745,7 +777,7 @@ def list_products_page():
     clear()
     render_header("إدارة وتعديل العطور المسجلة")
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products")
     products = cursor.fetchall()
@@ -789,7 +821,7 @@ def list_products_page():
 
 def handle_product_action(action, p_id):
     if action == 'del':
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
         conn.commit()
@@ -803,7 +835,7 @@ def edit_product_page(product_id):
     clear()
     render_header("تعديل بيانات العطر")
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
     product = cursor.fetchone()
@@ -823,11 +855,15 @@ def edit_product_page(product_id):
         file_upload("تحديث صورة العطر (اختياري)", name="image", accept="image/*")
     ])
     
+    if not data:
+        list_products_page()
+        return
+
     image_str = p_image
     if data['image'] and data['image'].get('content'):
         image_str = process_and_save_image(data['image'])
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
                    (data['name'], float(data['price']), data['currency'], image_str, product_id))
@@ -846,13 +882,13 @@ with app.app_context():
 
 app.add_url_rule('/', endpoint='webio_view', view_func=webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
 
+# Gunicorn Attribute Alias
+flask_app = app
+
 def open_browser():
     """Opens default web browser for local execution."""
     time.sleep(1.5)
     webbrowser.open(f"http://localhost:{PORT}")
-
-# Alias for Gunicorn targeting 'flask_app'
-flask_app = app
 
 if __name__ == '__main__':
     threading.Thread(target=open_browser, daemon=True).start()
