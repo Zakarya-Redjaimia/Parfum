@@ -676,7 +676,9 @@ def open_browser():
     webbrowser.open(f"http://localhost:{PORT}")
 
 
+# Add this near the bottom of main.py
+flask_app = app
+
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=open_browser, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, debug=True)
+    app.run(host="0.0.0.0", port=PORT)
