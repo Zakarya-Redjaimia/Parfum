@@ -8,9 +8,9 @@ import webbrowser
 from flask import Flask, send_file
 from pywebio.platform.flask import webio_view
 from pywebio import start_server
-from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT
+from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
 from pywebio.output import (
-    clear, put_html, put_table, put_buttons, actions, toast, 
+    clear, put_html, put_table, put_buttons, toast, 
     popup, close_popup, download
 )
 from reportlab.lib.pagesizes import A5
