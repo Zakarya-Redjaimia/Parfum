@@ -27,7 +27,7 @@ STORE_BRAND = "Luxury Impact Parfum RZ"
 CURRENCIES = {
     "EUR (€)": {"rate": 1.0, "symbol": "€"},
     "USD ($)": {"rate": 1.08, "symbol": "$"},
-    "DZD (د.ج)": {"rate": 145.0, "symbol": "د.ج"}
+    "DZD (د.ج)": {"rate": 220.0, "symbol": "د.ج"}
 }
 
 # Session State
@@ -76,10 +76,12 @@ def get_db_connection():
 # --- Helper Functions ---
 
 def convert_price(amount, from_curr, to_curr):
+    """Converts price accurately between configured currencies using EUR as base."""
     if from_curr not in CURRENCIES or to_curr not in CURRENCIES:
         return amount
-    usd_amount = amount / CURRENCIES[from_curr]["rate"]
-    return usd_amount * CURRENCIES[to_curr]["rate"]
+    # Convert from source currency to EUR base, then to target currency
+    eur_amount = amount / CURRENCIES[from_curr]["rate"]
+    return eur_amount * CURRENCIES[to_curr]["rate"]
 
 def process_and_save_image(file_data):
     if not file_data:
@@ -122,11 +124,14 @@ def main_menu():
     if current_user:
         user_info_html = f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']})</div>"
 
+    # Currency selection interface
+    curr_select = select("اختر عملة العرض والتسوق:", list(CURRENCIES.keys()), value=selected_currency)
+    if curr_select != selected_currency:
+        selected_currency = curr_select
+        toast(f"تم تغيير العملة إلى: {selected_currency}", color="info")
+
     put_html(f"""
         {user_info_html}
-        <div style="background: white; padding: 20px; border-radius: 12px; text-align: center; max-width: 500px; margin: 0 auto 20px auto; box-shadow: 0 2px 8px rgba(0,0,0,0.05);">
-            <label style="font-weight: bold; margin-bottom: 8px; display: block;">اختر عملة العرض:</label>
-        </div>
     """)
 
     options = [{'label': '🛍️ تصفح المتجر', 'value': 'shop', 'color': 'primary'}]
@@ -221,7 +226,7 @@ def user_shop():
     if not products:
         put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center; max-width: 600px; font-weight: 900;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
     else:
-        table_data = [["الصورة", "العطر", f"السعر ({curr_info['symbol']})", "الإجراء"]]
+        table_data = [["الصورة", "العطر", f"السعر الفردي ({curr_info['symbol']})", "الإجراء"]]
         for prod in products:
             p_id, name, base_price, item_currency, img_path = prod
             img_src = get_image_source(img_path)
@@ -231,7 +236,7 @@ def user_shop():
             table_data.append([
                 put_html(img_html),
                 name,
-                f"{disp_price:.2f} {curr_info['symbol']}",
+                f"{disp_price:,.2f} {curr_info['symbol']}",
                 put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}],
                             onclick=lambda val: add_to_cart(val))
             ])
@@ -247,6 +252,12 @@ def add_to_cart(product_id):
         login_page()
         return
 
+    # Select quantity when adding product
+    qty_data = input_group("إضافة المنتج إلى السلة", [
+        input("الكمية المطلوبة (1, 2, 3...):", name="qty", type=NUMBER, value=1, min=1, required=True)
+    ])
+    qty = int(qty_data['qty'])
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
@@ -254,20 +265,19 @@ def add_to_cart(product_id):
 
     if prod:
         p_id, name, base_price, item_curr, img = prod
-        usd_price = convert_price(base_price, item_curr, "USD ($)")
 
         cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND product_id = ?", 
                        (current_user['id'], product_id))
         cart_item = cursor.fetchone()
 
         if cart_item:
-            cursor.execute("UPDATE cart SET quantity = quantity + 1 WHERE id = ?", (cart_item[0],))
+            cursor.execute("UPDATE cart SET quantity = quantity + ? WHERE id = ?", (qty, cart_item[0]))
         else:
             cursor.execute("INSERT INTO cart (user_id, product_id, name, price, quantity, image) VALUES (?, ?, ?, ?, ?, ?)",
-                           (current_user['id'], product_id, name, usd_price, 1, img))
+                           (current_user['id'], product_id, name, base_price, qty, img))
 
         conn.commit()
-        toast(f"تمت إضافة {name} إلى السلة بنجاح!", color="success")
+        toast(f"تمت إضافة ({qty}) قطعة من {name} إلى السلة بنجاح!", color="success")
 
     conn.close()
 
@@ -282,7 +292,12 @@ def view_cart():
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT product_id, name, price, quantity, image FROM cart WHERE user_id = ?", (current_user['id'],))
+    cursor.execute("""
+        SELECT c.id, c.name, c.price, c.quantity, c.image, p.currency 
+        FROM cart c 
+        LEFT JOIN products p ON c.product_id = p.id 
+        WHERE c.user_id = ?
+    """, (current_user['id'],))
     items = cursor.fetchall()
     conn.close()
 
@@ -299,26 +314,28 @@ def view_cart():
         grand_total = 0.0
 
         for item in items:
-            c_id, name, base_usd_price, quantity, img_path = item
-            converted_price = convert_price(base_usd_price, "USD ($)", selected_currency)
-            total = converted_price * quantity
-            grand_total += total
+            c_id, name, base_price, quantity, img_path, orig_currency = item
+            item_currency = orig_currency if orig_currency else "EUR (€)"
+            
+            converted_unit_price = convert_price(base_price, item_currency, selected_currency)
+            total_item_price = converted_unit_price * quantity
+            grand_total += total_item_price
             img_src = get_image_source(img_path)
 
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
             table_data.append([
                 put_html(img_html),
                 name,
-                f"{converted_price:.2f} {curr_info['symbol']}",
+                f"{converted_unit_price:,.2f} {curr_info['symbol']}",
                 str(quantity),
-                f"{total:.2f} {curr_info['symbol']}"
+                f"{total_item_price:,.2f} {curr_info['symbol']}"
             ])
 
         put_table(table_data)
 
         put_html(f"""
             <div style="background: #ffffff; padding: 20px; border-radius: 12px; margin: 20px auto; max-width: 400px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); text-align: center; font-weight: 900;">
-                <h3 style="margin: 0; color: #1a202c; font-weight: 900; font-size: 22px;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:.2f} {curr_info['symbol']}</span></h3>
+                <h3 style="margin: 0; color: #1a202c; font-weight: 900; font-size: 22px;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:,.2f} {curr_info['symbol']}</span></h3>
             </div>
         """)
 
@@ -352,7 +369,12 @@ def generate_pdf_invoice():
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT name, price, quantity FROM cart WHERE user_id = ?", (current_user['id'],))
+    cursor.execute("""
+        SELECT c.name, c.price, c.quantity, p.currency 
+        FROM cart c 
+        LEFT JOIN products p ON c.product_id = p.id 
+        WHERE c.user_id = ?
+    """, (current_user['id'],))
     items = cursor.fetchall()
     conn.close()
 
@@ -389,13 +411,15 @@ def generate_pdf_invoice():
     grand_total = 0.0
 
     for item in items:
-        name, base_usd_price, qty = item
-        price = convert_price(base_usd_price, "USD ($)", selected_currency)
+        name, base_price, qty, orig_curr = item
+        item_curr = orig_curr if orig_curr else "EUR (€)"
+        
+        price = convert_price(base_price, item_curr, selected_currency)
         total = price * qty
         grand_total += total
-        data.append([name, f"{price:.2f} {curr_info['symbol']}", str(qty), f"{total:.2f} {curr_info['symbol']}"])
+        data.append([name, f"{price:,.2f} {curr_info['symbol']}", str(qty), f"{total:,.2f} {curr_info['symbol']}"])
 
-    data.append(["Grand Total", "", "", f"{grand_total:.2f} {curr_info['symbol']}"])
+    data.append(["Grand Total", "", "", f"{grand_total:,.2f} {curr_info['symbol']}"])
 
     t = Table(data, colWidths=[140, 70, 30, 80])
     t.setStyle(TableStyle([
@@ -490,7 +514,7 @@ def list_products_page():
                 str(p_id),
                 put_html(img_html),
                 name,
-                f"{disp_price:.2f} {curr_info['symbol']}",
+                f"{disp_price:,.2f} {curr_info['symbol']}",
                 put_buttons([
                     {'label': '✏️ تعديل', 'value': 'edit', 'color': 'warning'},
                     {'label': '🗑️ حذف', 'value': 'del', 'color': 'danger'}
@@ -563,12 +587,9 @@ def edit_product_page(product_id):
 app = Flask(__name__)
 app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
 
-# Gunicorn Attribute Alias (Crucial for Gunicorn main:flask_app invocation)
 flask_app = app
 
-# Helper for local development testing
 def open_browser():
-    """Opens local browser when executed directly."""
     time.sleep(1.5)
     webbrowser.open(f"http://localhost:{PORT}")
 
