@@ -8,7 +8,7 @@ from io import BytesIO
 import threading
 import webbrowser
 
-from flask import Flask
+from flask import Flask, request
 from pywebio.platform.flask import webio_view
 from pywebio import start_server
 from pywebio.session import local as session_local
@@ -16,6 +16,7 @@ from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT,
 from pywebio.output import (
     clear, put_html, put_table, put_buttons, toast, download
 )
+from werkzeug.security import generate_password_hash, check_password_hash
 from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -50,7 +51,10 @@ def init_db():
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
                 name TEXT NOT NULL,
-                role TEXT DEFAULT 'user'
+                role TEXT DEFAULT 'user',
+                created_ip TEXT,
+                user_agent TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         conn.execute("""
@@ -82,23 +86,18 @@ init_db()
 # --- Session Helpers & Security Decorators ---
 
 def get_current_user():
-    """Retrieves session-isolated user dict."""
     return getattr(session_local, 'user', None)
 
 def set_current_user(user_dict):
-    """Sets session-isolated user dict."""
     session_local.user = user_dict
 
 def get_selected_currency():
-    """Retrieves session-isolated selected currency."""
     return getattr(session_local, 'currency', "EUR (€)")
 
 def set_selected_currency(currency_code):
-    """Sets session-isolated currency."""
     session_local.currency = currency_code
 
 def require_auth(func):
-    """Decorator ensuring that only authenticated users access the route."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if not get_current_user():
@@ -109,7 +108,6 @@ def require_auth(func):
     return wrapper
 
 def require_admin(func):
-    """Decorator ensuring that only users with 'admin' role access the route."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         user = get_current_user()
@@ -120,10 +118,9 @@ def require_admin(func):
         return func(*args, **kwargs)
     return wrapper
 
-# --- Conversion Helpers ---
+# --- Conversion & Image Helpers ---
 
 def convert_price(amount, from_curr, to_curr):
-    """Calculates rates accurately from EUR base rate."""
     if from_curr not in CURRENCIES or to_curr not in CURRENCIES:
         return amount
     eur_amount = amount / CURRENCIES[from_curr]["rate"]
@@ -157,6 +154,23 @@ def render_footer():
         </div>
     """)
 
+# --- Currency Selection Step (Executed Once After Login) ---
+
+@require_auth
+def select_currency_once_page():
+    clear()
+    render_header("إعداد عملة التسوق للجلسة")
+
+    curr_choice = select(
+        "اختر عملة التسوق التي تود اعتمادها طوال هذه الجلسة:", 
+        list(CURRENCIES.keys()), 
+        value=get_selected_currency()
+    )
+    
+    set_selected_currency(curr_choice)
+    toast(f"تمت تهيئة عملة التسوق بنجاح: {curr_choice}", color="success")
+    main_menu()
+
 # --- Main Flow & Views ---
 
 def main_menu():
@@ -168,13 +182,11 @@ def main_menu():
 
     user_info_html = ""
     if current_user:
-        user_info_html = f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']})</div>"
-
-    # Currency selection persistence in active session
-    curr_select = select("اختر عملة العرض والتسوق الخاصة بك:", list(CURRENCIES.keys()), value=current_currency)
-    if curr_select != current_currency:
-        set_selected_currency(curr_select)
-        toast(f"تم اعتماد عملة التسوق: {curr_select}", color="info")
+        user_info_html = f"""
+            <div style='text-align: center; margin-bottom: 15px; background: #edf2f7; padding: 10px; border-radius: 8px;'>
+                <b>المستخدم الحالي:</b> {current_user['name']} ({current_user['role']}) | <b>العملة المعتمدة:</b> {current_currency}
+            </div>
+        """
 
     put_html(user_info_html)
 
@@ -183,7 +195,7 @@ def main_menu():
     if current_user:
         options.append({'label': '🛒 سلة التسوق', 'value': 'cart', 'color': 'success'})
         if current_user['role'] == 'admin':
-            options.append({'label': '⚙️ لوحة التحكم', 'value': 'admin', 'color': 'warning'})
+            options.append({'label': '⚙️ لوحة التحكم واستعراض السجلات', 'value': 'admin', 'color': 'warning'})
         options.append({'label': '🚪 تسجيل الخروج', 'value': 'logout', 'color': 'danger'})
     else:
         options.append({'label': '🔑 تسجيل الدخول', 'value': 'login', 'color': 'info'})
@@ -201,11 +213,11 @@ def main_menu():
         toast("تم تسجيل الخروج وتأمين الجلسة بنجاح.", color="info")
         main_menu()
 
-# --- Auth System ---
+# --- Security & Registration System ---
 
 def register_page():
     clear()
-    render_header("إنشاء حساب جديد")
+    render_header("إنشاء حساب جديد وتوثيق بيانات الأمان")
 
     data = input_group("تسجيل حساب جديد", [
         input("الاسم الكامل", name="name", required=True),
@@ -214,15 +226,23 @@ def register_page():
         select("نوع الحساب", [("مستخدم عادي", "user"), ("مدير النظام", "admin")], name="role")
     ])
 
+    # Capturing Client IP and User-Agent Securely
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    user_agent = request.headers.get('User-Agent', 'Unknown Browser')
+
+    # Hash the password before storing
+    hashed_password = generate_password_hash(data['password'].strip())
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
         try:
             cursor.execute(
-                "INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)",
-                (data['name'].strip(), data['username'].strip(), data['password'].strip(), data['role'])
+                """INSERT INTO users (name, username, password, role, created_ip, user_agent) 
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (data['name'].strip(), data['username'].strip(), hashed_password, data['role'], client_ip, user_agent)
             )
             conn.commit()
-            toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
+            toast("تم إنشاء الحساب بنجاح وتشفير بيانات الاعتماد!", color="success")
             login_page()
         except sqlite3.IntegrityError:
             toast("اسم المستخدم هذا مستخدم بالفعل. يرجى اختيار اسم آخر.", color="error")
@@ -240,21 +260,24 @@ def login_page():
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, name, username, role FROM users WHERE username = ? AND password = ?", 
-            (data['username'].strip(), data['password'].strip())
+            "SELECT id, name, username, password, role FROM users WHERE username = ?", 
+            (data['username'].strip(),)
         )
         user = cursor.fetchone()
 
-    if user:
+    # Validate Hashed Password
+    if user and check_password_hash(user['password'], data['password'].strip()):
         user_dict = {'id': user['id'], 'name': user['name'], 'username': user['username'], 'role': user['role']}
         set_current_user(user_dict)
-        toast(f"مرحباً بك {user['name']}! تم توثيق دخولك بنجاح.", color="success")
-        main_menu()
+        toast(f"مرحباً بك {user['name']}!", color="success")
+        
+        # Mandatory: Choose Currency Once Immediately After Login
+        select_currency_once_page()
     else:
         toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
-# --- Protected Store & Cart Views ---
+# --- Store & Cart Views ---
 
 def user_shop():
     clear()
@@ -480,24 +503,53 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", pdf_data)
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Protected Admin Dashboard ---
+# --- Protected Admin Dashboard with Security Audit Logs ---
 
 @require_admin
 def admin_dashboard():
     clear()
-    render_header("لوحة التحكم وإدارة العطور")
-
-    put_html("<h2 style='color: #1a202c; text-align: center; font-weight: 900; font-size: 24px;'>⚙️ لوحة إدارة المتجر</h2>")
+    render_header("لوحة التحكم وإدارة الأمان")
 
     choice = actions("اختر العملية المطلوبة:", [
+        {'label': '🛡️ سجل أمان الحسابات (IP & User-Agent)', 'value': 'audit_log', 'color': 'danger'},
         {'label': '➕ إضافة عطر جديد', 'value': 'add', 'color': 'success'},
         {'label': '📋 عرض وتعديل قائمة العطور', 'value': 'list', 'color': 'primary'},
         {'label': '🔙 العودة للقائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
     ])
 
-    if choice == 'add': add_product_page(); return
+    if choice == 'audit_log': view_security_logs_page(); return
+    elif choice == 'add': add_product_page(); return
     elif choice == 'list': list_products_page(); return
     elif choice == 'home': main_menu(); return
+
+@require_admin
+def view_security_logs_page():
+    clear()
+    render_header("سجل أمان الحسابات المسجلة")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, name, role, created_ip, user_agent, created_at FROM users")
+        users = cursor.fetchall()
+
+    if not users:
+        put_html("<p style='text-align:center;'>لا يوجد مستخدمون في قاعدة البيانات.</p>")
+    else:
+        table_data = [["المعرف", "اسم المستخدم", "الاسم الكامل", "الرتبة", "IP Address", "User-Agent", "تاريخ التسجيل"]]
+        for u in users:
+            table_data.append([
+                str(u['id']),
+                u['username'],
+                u['name'],
+                u['role'],
+                u['created_ip'] or "N/A",
+                u['user_agent'] or "N/A",
+                u['created_at'] or "N/A"
+            ])
+        put_table(table_data)
+
+    act = actions("", [{'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'}])
+    if act == 'admin': admin_dashboard()
 
 @require_admin
 def add_product_page():
