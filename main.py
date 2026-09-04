@@ -2,16 +2,19 @@ import sqlite3
 import time
 import os
 import io
+import functools
+import base64
 from io import BytesIO
 import threading
 import webbrowser
-from flask import Flask, send_file
+
+from flask import Flask
 from pywebio.platform.flask import webio_view
 from pywebio import start_server
+from pywebio.session import local as session_local
 from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
 from pywebio.output import (
-    clear, put_html, put_table, put_buttons, toast, 
-    popup, close_popup, download
+    clear, put_html, put_table, put_buttons, toast, download
 )
 from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
@@ -30,70 +33,112 @@ CURRENCIES = {
     "DZD (د.ج)": {"rate": 220.0, "symbol": "د.ج"}
 }
 
-# Session State
-current_user = None
-selected_currency = "EUR (€)"
-
-# --- Database On-Demand Creation ---
+# --- Database Security Initialization ---
 
 def get_db_connection():
-    """Returns a connection to the SQLite database and ensures tables are created on demand."""
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            name TEXT NOT NULL,
-            role TEXT DEFAULT 'user'
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            price REAL NOT NULL,
-            currency TEXT NOT NULL,
-            image TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cart (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            price REAL NOT NULL,
-            quantity INTEGER NOT NULL,
-            image TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (product_id) REFERENCES products(id)
-        )
-    """)
-    conn.commit()
+    """Returns a thread-safe connection to the SQLite database."""
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    conn.row_factory = sqlite3.Row
     return conn
 
-# --- Helper Functions ---
+def init_db():
+    """Ensures database schema exists before handling any web sessions."""
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT DEFAULT 'user'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                currency TEXT NOT NULL,
+                image TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cart (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity INTEGER NOT NULL,
+                image TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# --- Session Helpers & Security Decorators ---
+
+def get_current_user():
+    """Retrieves session-isolated user dict."""
+    return getattr(session_local, 'user', None)
+
+def set_current_user(user_dict):
+    """Sets session-isolated user dict."""
+    session_local.user = user_dict
+
+def get_selected_currency():
+    """Retrieves session-isolated selected currency."""
+    return getattr(session_local, 'currency', "EUR (€)")
+
+def set_selected_currency(currency_code):
+    """Sets session-isolated currency."""
+    session_local.currency = currency_code
+
+def require_auth(func):
+    """Decorator ensuring that only authenticated users access the route."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not get_current_user():
+            toast("عذراً! يجب تسجيل الدخول بالاسم وكلمة المرور الصحيحة أولاً.", color="warning")
+            login_page()
+            return
+        return func(*args, **kwargs)
+    return wrapper
+
+def require_admin(func):
+    """Decorator ensuring that only users with 'admin' role access the route."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        user = get_current_user()
+        if not user or user.get('role') != 'admin':
+            toast("غير مصرح لك بالوصول إلى هذه الصفحة. صلاحيات مدير النظام مطلوبة.", color="error")
+            main_menu()
+            return
+        return func(*args, **kwargs)
+    return wrapper
+
+# --- Conversion Helpers ---
 
 def convert_price(amount, from_curr, to_curr):
-    """Converts price accurately between configured currencies using EUR as base."""
+    """Calculates rates accurately from EUR base rate."""
     if from_curr not in CURRENCIES or to_curr not in CURRENCIES:
         return amount
-    # Convert from source currency to EUR base, then to target currency
     eur_amount = amount / CURRENCIES[from_curr]["rate"]
     return eur_amount * CURRENCIES[to_curr]["rate"]
 
 def process_and_save_image(file_data):
-    if not file_data:
+    if not file_data or 'content' not in file_data:
         return ""
-    import base64
     content = file_data['content']
     mime = file_data.get('mime_type', 'image/jpeg')
     b64_str = base64.b64encode(content).decode('utf-8')
     return f"data:{mime};base64,{b64_str}"
 
 def get_image_source(img_path):
-    if img_path and img_path.startswith("data:image"):
+    if img_path and str(img_path).startswith("data:image"):
         return img_path
     return "https://via.placeholder.com/150?text=No+Image"
 
@@ -112,27 +157,26 @@ def render_footer():
         </div>
     """)
 
-# --- Main Views ---
+# --- Main Flow & Views ---
 
 def main_menu():
     clear()
     render_header("المتجر الإلكتروني الرسمي للعطور الفاخرة")
 
-    global current_user, selected_currency
+    current_user = get_current_user()
+    current_currency = get_selected_currency()
 
     user_info_html = ""
     if current_user:
         user_info_html = f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']})</div>"
 
-    # Currency selection interface
-    curr_select = select("اختر عملة العرض والتسوق:", list(CURRENCIES.keys()), value=selected_currency)
-    if curr_select != selected_currency:
-        selected_currency = curr_select
-        toast(f"تم تغيير العملة إلى: {selected_currency}", color="info")
+    # Currency selection persistence in active session
+    curr_select = select("اختر عملة العرض والتسوق الخاصة بك:", list(CURRENCIES.keys()), value=current_currency)
+    if curr_select != current_currency:
+        set_selected_currency(curr_select)
+        toast(f"تم اعتماد عملة التسوق: {curr_select}", color="info")
 
-    put_html(f"""
-        {user_info_html}
-    """)
+    put_html(user_info_html)
 
     options = [{'label': '🛍️ تصفح المتجر', 'value': 'shop', 'color': 'primary'}]
 
@@ -153,8 +197,8 @@ def main_menu():
     elif choice == 'login': login_page()
     elif choice == 'register': register_page()
     elif choice == 'logout':
-        current_user = None
-        toast("تم تسجيل الخروج بنجاح.", color="info")
+        set_current_user(None)
+        toast("تم تسجيل الخروج وتأمين الجلسة بنجاح.", color="info")
         main_menu()
 
 # --- Auth System ---
@@ -170,65 +214,66 @@ def register_page():
         select("نوع الحساب", [("مستخدم عادي", "user"), ("مدير النظام", "admin")], name="role")
     ])
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)",
-                       (data['name'], data['username'], data['password'], data['role']))
-        conn.commit()
-        toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
-        login_page()
-    except sqlite3.IntegrityError:
-        toast("اسم المستخدم مستخدم بالفعل. اختر اسماً آخر.", color="error")
-        register_page()
-    finally:
-        conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)",
+                (data['name'].strip(), data['username'].strip(), data['password'].strip(), data['role'])
+            )
+            conn.commit()
+            toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
+            login_page()
+        except sqlite3.IntegrityError:
+            toast("اسم المستخدم هذا مستخدم بالفعل. يرجى اختيار اسم آخر.", color="error")
+            register_page()
 
 def login_page():
     clear()
-    render_header("تسجيل الدخول")
+    render_header("تسجيل الدخول الآمن")
 
-    data = input_group("تسجيل الدخول", [
+    data = input_group("أدخل بيانات الاعتماد", [
         input("اسم المستخدم", name="username", required=True),
         input("كلمة المرور", name="password", type=TEXT, required=True)
     ])
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, username, role FROM users WHERE username = ? AND password = ?", 
-                   (data['username'], data['password']))
-    user = cursor.fetchone()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, name, username, role FROM users WHERE username = ? AND password = ?", 
+            (data['username'].strip(), data['password'].strip())
+        )
+        user = cursor.fetchone()
 
     if user:
-        global current_user
-        current_user = {'id': user[0], 'name': user[1], 'username': user[2], 'role': user[3]}
-        toast(f"مرحباً بك {user[1]}!", color="success")
+        user_dict = {'id': user['id'], 'name': user['name'], 'username': user['username'], 'role': user['role']}
+        set_current_user(user_dict)
+        toast(f"مرحباً بك {user['name']}! تم توثيق دخولك بنجاح.", color="success")
         main_menu()
     else:
-        toast("بيانات الدخول غير صحيحة!", color="error")
+        toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
-# --- Store & Cart Views ---
+# --- Protected Store & Cart Views ---
 
 def user_shop():
     clear()
     render_header("تصفح قائمة العطور")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products")
-    products = cursor.fetchall()
-    conn.close()
-
+    selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products")
+        products = cursor.fetchall()
 
     if not products:
         put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center; max-width: 600px; font-weight: 900;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
     else:
         table_data = [["الصورة", "العطر", f"السعر الفردي ({curr_info['symbol']})", "الإجراء"]]
         for prod in products:
-            p_id, name, base_price, item_currency, img_path = prod
+            p_id, name, base_price, item_currency, img_path = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
@@ -245,63 +290,54 @@ def user_shop():
     act = actions("", [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}])
     if act == 'home': main_menu()
 
+@require_auth
 def add_to_cart(product_id):
-    global current_user
-    if not current_user:
-        toast("يجب تسجيل الدخول أولاً لإضافة منتجات إلى السلة!", color="warning")
-        login_page()
-        return
+    current_user = get_current_user()
 
-    # Select quantity when adding product
     qty_data = input_group("إضافة المنتج إلى السلة", [
         input("الكمية المطلوبة (1, 2, 3...):", name="qty", type=NUMBER, value=1, min=1, required=True)
     ])
     qty = int(qty_data['qty'])
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
-    prod = cursor.fetchone()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
+        prod = cursor.fetchone()
 
-    if prod:
-        p_id, name, base_price, item_curr, img = prod
+        if prod:
+            p_id, name, base_price, item_curr, img = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
 
-        cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND product_id = ?", 
-                       (current_user['id'], product_id))
-        cart_item = cursor.fetchone()
+            cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND product_id = ?", 
+                           (current_user['id'], product_id))
+            cart_item = cursor.fetchone()
 
-        if cart_item:
-            cursor.execute("UPDATE cart SET quantity = quantity + ? WHERE id = ?", (qty, cart_item[0]))
-        else:
-            cursor.execute("INSERT INTO cart (user_id, product_id, name, price, quantity, image) VALUES (?, ?, ?, ?, ?, ?)",
-                           (current_user['id'], product_id, name, base_price, qty, img))
+            if cart_item:
+                cursor.execute("UPDATE cart SET quantity = quantity + ? WHERE id = ?", (qty, cart_item['id']))
+            else:
+                cursor.execute("INSERT INTO cart (user_id, product_id, name, price, quantity, image) VALUES (?, ?, ?, ?, ?, ?)",
+                               (current_user['id'], product_id, name, base_price, qty, img))
 
-        conn.commit()
-        toast(f"تمت إضافة ({qty}) قطعة من {name} إلى السلة بنجاح!", color="success")
+            conn.commit()
+            toast(f"تمت إضافة ({qty}) قطعة من {name} إلى السلة بنجاح!", color="success")
 
-    conn.close()
-
+@require_auth
 def view_cart():
     clear()
     render_header("سلة التسوق الخاصة بك")
 
-    if not current_user:
-        toast("يرجى تسجيل الدخول لعرض السلة.", color="warning")
-        login_page()
-        return
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT c.id, c.name, c.price, c.quantity, c.image, p.currency 
-        FROM cart c 
-        LEFT JOIN products p ON c.product_id = p.id 
-        WHERE c.user_id = ?
-    """, (current_user['id'],))
-    items = cursor.fetchall()
-    conn.close()
-
+    current_user = get_current_user()
+    selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.id, c.name, c.price, c.quantity, c.image, p.currency 
+            FROM cart c 
+            LEFT JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = ?
+        """, (current_user['id'],))
+        items = cursor.fetchall()
 
     if not items:
         put_html("""
@@ -314,7 +350,7 @@ def view_cart():
         grand_total = 0.0
 
         for item in items:
-            c_id, name, base_price, quantity, img_path, orig_currency = item
+            name, base_price, quantity, img_path, orig_currency = item['name'], item['price'], item['quantity'], item['image'], item['currency']
             item_currency = orig_currency if orig_currency else "EUR (€)"
             
             converted_unit_price = convert_price(base_price, item_currency, selected_currency)
@@ -353,36 +389,35 @@ def view_cart():
 
     render_footer()
 
+@require_auth
 def empty_user_cart():
-    if current_user:
-        conn = get_db_connection()
+    current_user = get_current_user()
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
         conn.commit()
-        conn.close()
-        toast("تم تفريغ سلة التسوق بنجاح.", color="info")
+    toast("تم تفريغ سلة التسوق بنجاح.", color="info")
     view_cart()
 
+@require_auth
 def generate_pdf_invoice():
-    if not current_user:
-        return
+    current_user = get_current_user()
+    selected_currency = get_selected_currency()
+    curr_info = CURRENCIES[selected_currency]
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT c.name, c.price, c.quantity, p.currency 
-        FROM cart c 
-        LEFT JOIN products p ON c.product_id = p.id 
-        WHERE c.user_id = ?
-    """, (current_user['id'],))
-    items = cursor.fetchall()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.name, c.price, c.quantity, p.currency 
+            FROM cart c 
+            LEFT JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = ?
+        """, (current_user['id'],))
+        items = cursor.fetchall()
 
     if not items:
         toast("السلة فارغة، لا يمكن إنتاج فاتورة!", color="warning")
         return
-
-    curr_info = CURRENCIES[selected_currency]
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A5, rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
@@ -411,7 +446,7 @@ def generate_pdf_invoice():
     grand_total = 0.0
 
     for item in items:
-        name, base_price, qty, orig_curr = item
+        name, base_price, qty, orig_curr = item['name'], item['price'], item['quantity'], item['currency']
         item_curr = orig_curr if orig_curr else "EUR (€)"
         
         price = convert_price(base_price, item_curr, selected_currency)
@@ -445,8 +480,9 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", pdf_data)
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Administration Views ---
+# --- Protected Admin Dashboard ---
 
+@require_admin
 def admin_dashboard():
     clear()
     render_header("لوحة التحكم وإدارة العطور")
@@ -463,6 +499,7 @@ def admin_dashboard():
     elif choice == 'list': list_products_page(); return
     elif choice == 'home': main_menu(); return
 
+@require_admin
 def add_product_page():
     clear()
     render_header("إضافة عطر جديد إلى المتجر")
@@ -476,34 +513,34 @@ def add_product_page():
 
     image_str = process_and_save_image(data['image'])
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
-                   (data['name'], float(data['price']), data['currency'], image_str))
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
+                       (data['name'].strip(), float(data['price']), data['currency'], image_str))
+        conn.commit()
 
     toast("تمت إضافة العطر بنجاح!", color="success")
     admin_dashboard()
 
+@require_admin
 def list_products_page():
     clear()
     render_header("إدارة وتعديل العطور المسجلة")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products")
-    products = cursor.fetchall()
-    conn.close()
-
+    selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products")
+        products = cursor.fetchall()
 
     if not products:
         put_html("<div style='background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: 20px auto; font-weight: 900;'><h3>لا توجد عطور متوفرة للتعديل.</h3></div>")
     else:
         table_data = [["المعرف", "الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
         for prod in products:
-            p_id, name, base_price, item_currency, img_path = prod
+            p_id, name, base_price, item_currency, img_path = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
 
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
@@ -528,38 +565,35 @@ def list_products_page():
     ])
     if act == 'admin':
         admin_dashboard()
-        return
 
-    render_footer()
-
+@require_admin
 def handle_product_action(action, p_id):
     if action == 'del':
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
-        conn.commit()
-        conn.close()
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
+            conn.commit()
         toast("تم حذف العطر بنجاح.", color="info")
         list_products_page()
     elif action == 'edit':
         edit_product_page(p_id)
 
+@require_admin
 def edit_product_page(product_id):
     clear()
     render_header("تعديل بيانات العطر")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
-    product = cursor.fetchone()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
+        product = cursor.fetchone()
 
     if not product:
         toast("العطر غير موجود!", color="error")
         list_products_page()
         return
 
-    _, p_name, p_price, p_currency, p_image = product
+    p_name, p_price, p_currency, p_image = product['name'], product['price'], product['currency'], product['image']
 
     data = input_group("تعديل العطر", [
         input("اسم العطر", name="name", value=p_name, required=True),
@@ -572,17 +606,18 @@ def edit_product_page(product_id):
     if data['image'] and data['image'].get('content'):
         image_str = process_and_save_image(data['image'])
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
-                   (data['name'], float(data['price']), data['currency'], image_str, product_id))
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
+            (data['name'].strip(), float(data['price']), data['currency'], image_str, product_id)
+        )
+        conn.commit()
 
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- Server & Flask WSGI Setup ---
+# --- WSGI App Setup ---
 
 app = Flask(__name__)
 app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
