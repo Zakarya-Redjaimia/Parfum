@@ -46,15 +46,12 @@ CURRENCIES = {
 selected_currency = "DZD (DA)"
 current_user = None
 
-def get_db_connection():
-    """Returns a thread-safe connection to the SQLite database."""
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=15)
-    return conn
-
-def init_db():
-    """Initializes SQLite tables and applies necessary schema migrations."""
+def ensure_db_ready():
+    """Ensures storage directory, DB file, and required tables exist before any operation."""
+    os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    conn = get_db_connection()
+    
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=15)
     cursor = conn.cursor()
     
     # Users Table
@@ -88,9 +85,11 @@ def init_db():
                         quantity INTEGER NOT NULL)''')
                         
     conn.commit()
-    conn.close()
+    return conn
 
-init_db()
+# Ensure schema on app start
+conn_init = ensure_db_ready()
+conn_init.close()
 
 # --- Helper Utilities ---
 
@@ -408,13 +407,14 @@ def register_page():
 
     hashed_pwd = md5_hash(data['password'])
 
+    # Dynamic Creation Check on Registration
+    conn = ensure_db_ready()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM users WHERE email = ?", (data['email'],))
         if cursor.fetchone():
-            toast("البريد الإلكتروني مسجل بالفعل!", color="error")
             conn.close()
+            toast("البريد الإلكتروني مسجل بالفعل!", color="error")
             register_page()
             return
             
@@ -426,6 +426,8 @@ def register_page():
         toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
         login_page()
     except Exception as e:
+        if conn:
+            conn.close()
         toast(f"حدث خطأ أثناء إنشاء الحساب: {str(e)}", color="error")
         main_menu()
 
@@ -443,7 +445,7 @@ def login_page():
         return
 
     hashed_pwd = md5_hash(data['password'])
-    conn = get_db_connection()
+    conn = ensure_db_ready()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, email FROM users WHERE email = ? AND password = ?", (data['email'], hashed_pwd))
     user = cursor.fetchone()
@@ -468,7 +470,7 @@ def user_shop():
     clear()
     render_header("تصفح مجموعة العطور الملكية والمتميزة")
     
-    conn = get_db_connection()
+    conn = ensure_db_ready()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products")
     products = cursor.fetchall()
@@ -544,7 +546,7 @@ def add_to_cart(product_id, quantity):
         login_page()
         return
         
-    conn = get_db_connection()
+    conn = ensure_db_ready()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
     product = cursor.fetchone()
@@ -578,7 +580,7 @@ def view_cart():
         login_page()
         return
 
-    conn = get_db_connection()
+    conn = ensure_db_ready()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, quantity, image FROM cart WHERE user_id = ?", (current_user['id'],))
     items = cursor.fetchall()
@@ -636,7 +638,7 @@ def view_cart():
 
 def empty_user_cart():
     if current_user:
-        conn = get_db_connection()
+        conn = ensure_db_ready()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
         conn.commit()
@@ -648,7 +650,7 @@ def generate_pdf_invoice():
     if not current_user:
         return
         
-    conn = get_db_connection()
+    conn = ensure_db_ready()
     cursor = conn.cursor()
     cursor.execute("SELECT name, price, quantity FROM cart WHERE user_id = ?", (current_user['id'],))
     items = cursor.fetchall()
@@ -761,9 +763,10 @@ def add_product_page():
         admin_dashboard()
         return
 
+    # Dynamic Creation Check on Product Upload
+    conn = ensure_db_ready()
     image_str = process_and_save_image(data['image'])
         
-    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
                    (data['name'], float(data['price']), data['currency'], image_str))
@@ -777,7 +780,7 @@ def list_products_page():
     clear()
     render_header("إدارة وتعديل العطور المسجلة")
     
-    conn = get_db_connection()
+    conn = ensure_db_ready()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products")
     products = cursor.fetchall()
@@ -821,7 +824,7 @@ def list_products_page():
 
 def handle_product_action(action, p_id):
     if action == 'del':
-        conn = get_db_connection()
+        conn = ensure_db_ready()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
         conn.commit()
@@ -835,7 +838,7 @@ def edit_product_page(product_id):
     clear()
     render_header("تعديل بيانات العطر")
     
-    conn = get_db_connection()
+    conn = ensure_db_ready()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
     product = cursor.fetchone()
@@ -863,7 +866,7 @@ def edit_product_page(product_id):
     if data['image'] and data['image'].get('content'):
         image_str = process_and_save_image(data['image'])
 
-    conn = get_db_connection()
+    conn = ensure_db_ready()
     cursor = conn.cursor()
     cursor.execute("UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
                    (data['name'], float(data['price']), data['currency'], image_str, product_id))
@@ -878,7 +881,8 @@ def edit_product_page(product_id):
 app = Flask(__name__)
 
 with app.app_context():
-    init_db()
+    conn_context = ensure_db_ready()
+    conn_context.close()
 
 app.add_url_rule('/', endpoint='webio_view', view_func=webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
 
