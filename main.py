@@ -18,9 +18,9 @@ from pywebio.input import input, select, input_group, TEXT, NUMBER, PASSWORD
 from pywebio.output import (
     put_text, put_markdown, put_table, put_buttons, put_button,
     put_html, popup, close_popup, clear, put_success, put_warning,
-    put_error, put_info, put_image
+    put_error, put_info, put_image, download
 )
-from pywebio.session import set_env
+from pywebio.session import set_env, local as session_local
 
 # ReportLab Imports for PDF Generation
 from reportlab.lib.pagesizes import A4
@@ -32,20 +32,30 @@ from reportlab.lib import colors
 import qrcode
 
 # ------------------------------------------------------------------------------
-# ENVIRONMENT & PORT CONFIGURATION
+# ENVIRONMENT & PATH CONFIGURATION (RENDER-SAFE)
 # ------------------------------------------------------------------------------
 PORT = int(os.environ.get("PORT", 8080))
-DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "store.db")
+
+# Store DB in /tmp or custom render volume path to ensure write permissions
+DATA_DIR = os.environ.get("RENDER_DATA_DIR", "/tmp")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_NAME = os.path.join(DATA_DIR, "store.db")
 
 # ------------------------------------------------------------------------------
-# DATABASE INITIALIZATION
+# DATABASE INITIALIZATION & THREAD-SAFE CONNECTIONS
 # ------------------------------------------------------------------------------
 def get_db():
-    conn = sqlite3.connect(DB_NAME)
+    """Returns a thread-safe connection to SQLite with WAL mode enabled."""
+    conn = sqlite3.connect(DB_NAME, timeout=20.0)
     conn.row_factory = sqlite3.Row
+    # Enable Write-Ahead Logging for better concurrent read/write handling on Gunicorn
+    conn.execute('PRAGMA journal_mode=WAL;')
     return conn
 
 def init_db():
+    """Initializes tables idempotently."""
     conn = get_db()
     cursor = conn.cursor()
     
@@ -100,7 +110,7 @@ def init_db():
         )
     ''')
     
-    # Create default admin user if database is empty
+    # Seed initial default admin user
     cursor.execute('SELECT COUNT(*) FROM users')
     if cursor.fetchone()[0] == 0:
         admin_pass_hash = hashlib.sha256("admin123".encode()).hexdigest()
@@ -112,14 +122,12 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Auto-execute DB initialization at module load time for Gunicorn boot
+# Auto-execute DB initialization at module import time
 init_db()
 
 # ------------------------------------------------------------------------------
-# AUTHENTICATION & SESSION STATE
+# AUTHENTICATION & SESSION HANDLING (PER-SESSION ISOLATION)
 # ------------------------------------------------------------------------------
-CURRENT_USER = {"username": None, "role": None}
-
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -148,8 +156,9 @@ def login_page():
     
     user = verify_user(data['username'], data['password'])
     if user:
-        CURRENT_USER['username'] = user['username']
-        CURRENT_USER['role'] = user['role']
+        # Use pywebio session local to isolate multiple web users
+        session_local.username = user['username']
+        session_local.role = user['role']
         put_success(f"Welcome back, {user['username']}!")
         main_menu()
     else:
@@ -157,12 +166,12 @@ def login_page():
         put_button("Try Again", onclick=login_page)
 
 def logout():
-    CURRENT_USER['username'] = None
-    CURRENT_USER['role'] = None
+    session_local.username = None
+    session_local.role = None
     login_page()
 
 # ------------------------------------------------------------------------------
-# PERFUME & INVENTORY MANAGEMENT
+# INVENTORY & FORM INPUT/OUTPUT HANDLERS
 # ------------------------------------------------------------------------------
 def add_perfume_form():
     clear()
@@ -171,9 +180,9 @@ def add_perfume_form():
     data = input_group("Perfume Details", [
         input("Perfume Name", name="name", type=TEXT, required=True),
         select("Category", options=["Oriental", "Woody", "Floral", "Fresh", "Citrus", "Gourmand"], name="category"),
-        input("Top Notes (comma separated)", name="top_notes", type=TEXT),
-        input("Heart Notes (comma separated)", name="heart_notes", type=TEXT),
-        input("Base Notes (comma separated)", name="base_notes", type=TEXT),
+        input("Top Notes", name="top_notes", type=TEXT, placeholder="e.g. Bergamot, Saffron"),
+        input("Heart Notes", name="heart_notes", type=TEXT, placeholder="e.g. Rose, Jasmine"),
+        input("Base Notes", name="base_notes", type=TEXT, placeholder="e.g. Amber, Oud, Vanilla"),
         input("Initial Stock Quantity", name="stock_qty", type=NUMBER, value=10),
         input("Purchase Price (DZD)", name="purchase_price", type=NUMBER, value=1000.0),
         input("Selling Price (DZD)", name="selling_price", type=NUMBER, value=2000.0),
@@ -187,7 +196,7 @@ def add_perfume_form():
             INSERT INTO perfumes (name, category, top_notes, heart_notes, base_notes, stock_qty, purchase_price, selling_price, min_stock_alert)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            data['name'], data['category'], data['top_notes'],
+            data['name'].strip(), data['category'], data['top_notes'],
             data['heart_notes'], data['base_notes'], int(data['stock_qty']),
             float(data['purchase_price']), float(data['selling_price']),
             int(data['min_stock_alert'])
@@ -272,7 +281,7 @@ def edit_perfume(perfume_id):
         SET name=?, category=?, top_notes=?, heart_notes=?, base_notes=?, stock_qty=?, purchase_price=?, selling_price=?, min_stock_alert=?
         WHERE id=?
     ''', (
-        data['name'], data['category'], data['top_notes'], data['heart_notes'],
+        data['name'].strip(), data['category'], data['top_notes'], data['heart_notes'],
         data['base_notes'], int(data['stock_qty']), float(data['purchase_price']),
         float(data['selling_price']), int(data['min_stock_alert']), perfume_id
     ))
@@ -292,7 +301,7 @@ def delete_perfume(perfume_id):
     inventory_view()
 
 # ------------------------------------------------------------------------------
-# QR CODE GENERATION
+# QR CODE GENERATOR
 # ------------------------------------------------------------------------------
 def generate_perfume_qr(perfume_id):
     conn = get_db()
@@ -305,12 +314,12 @@ def generate_perfume_qr(perfume_id):
         return
         
     qr_data = (
-        f"Luxury Impact Parfume Rz\n"
-        f"Fragrance: {p['name']}\n"
+        f"Brand: Luxury Impact Parfume Rz\n"
+        f"Name: {p['name']}\n"
         f"Category: {p['category']}\n"
-        f"Top Notes: {p['top_notes']}\n"
-        f"Heart Notes: {p['heart_notes']}\n"
-        f"Base Notes: {p['base_notes']}\n"
+        f"Top: {p['top_notes']}\n"
+        f"Heart: {p['heart_notes']}\n"
+        f"Base: {p['base_notes']}\n"
         f"Price: {p['selling_price']} DZD"
     )
     
@@ -332,7 +341,7 @@ def generate_perfume_qr(perfume_id):
     ])
 
 # ------------------------------------------------------------------------------
-# POINT OF SALE (POS)
+# POINT OF SALE (POS) & TRANSACTION PROCESSING
 # ------------------------------------------------------------------------------
 def process_sale_view():
     clear()
@@ -349,7 +358,7 @@ def process_sale_view():
         put_button("Back to Dashboard", onclick=main_menu)
         return
         
-    item_options = [{"label": f"{i['name']} (In Stock: {i['stock_qty']}) - {i['selling_price']} DZD", "value": i['id']} for i in items]
+    item_options = [{"label": f"{i['name']} (Stock: {i['stock_qty']}) - {i['selling_price']} DZD", "value": i['id']} for i in items]
     
     sale_data = input_group("New Transaction", [
         select("Select Perfume", options=item_options, name="perfume_id"),
@@ -374,11 +383,13 @@ def process_sale_view():
     total_price = unit_price * qty
     new_stock = perfume['stock_qty'] - qty
     
+    current_username = getattr(session_local, 'username', 'admin')
+    
     cursor.execute('UPDATE perfumes SET stock_qty = ? WHERE id = ?', (new_stock, perfume_id))
     cursor.execute('''
         INSERT INTO sales (perfume_id, qty, unit_price, total_price, seller_username)
         VALUES (?, ?, ?, ?, ?)
-    ''', (perfume_id, qty, unit_price, total_price, CURRENT_USER['username']))
+    ''', (perfume_id, qty, unit_price, total_price, current_username))
     
     conn.commit()
     conn.close()
@@ -386,13 +397,13 @@ def process_sale_view():
     put_success(f"Sale Processed! Total: {total_price:.2f} DZD")
     
     put_buttons([
-        {"label": "📄 Print PDF Invoice", "value": "pdf", "color": "primary"},
+        {"label": "📄 Download PDF Receipt", "value": "pdf", "color": "primary"},
         {"label": "New Sale", "value": "new", "color": "success"},
         {"label": "Main Dashboard", "value": "dashboard", "color": "secondary"}
     ], onclick=lambda btn: generate_sales_pdf(perfume['name'], qty, unit_price, total_price) if btn == "pdf" else (process_sale_view() if btn == "new" else main_menu()))
 
 # ------------------------------------------------------------------------------
-# FINANCIALS & EXPENSES
+# FINANCIAL REPORTS & EXPENSE MANAGEMENT
 # ------------------------------------------------------------------------------
 def add_expense():
     clear()
@@ -403,12 +414,14 @@ def add_expense():
         input("Amount (DZD)", name="amount", type=NUMBER, required=True)
     ])
     
+    current_username = getattr(session_local, 'username', 'admin')
+    
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO expenses (description, amount, created_by)
         VALUES (?, ?, ?)
-    ''', (data['description'], float(data['amount']), CURRENT_USER['username']))
+    ''', (data['description'], float(data['amount']), current_username))
     conn.commit()
     conn.close()
     
@@ -440,28 +453,28 @@ def financial_overview():
     conn.close()
     
     put_html(f"""
-    <div style="display: flex; gap: 20px; margin-top: 20px;">
-        <div style="background-color: #28a745; color: white; padding: 20px; border-radius: 8px; flex: 1;">
+    <div style="display: flex; flex-wrap: wrap; gap: 15px; margin-top: 20px;">
+        <div style="background-color: #28a745; color: white; padding: 20px; border-radius: 8px; flex: 1; min-width: 200px;">
             <h3>Total Sales Revenue</h3>
             <h2>{total_revenue:,.2f} DZD</h2>
         </div>
-        <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px; flex: 1;">
+        <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px; flex: 1; min-width: 200px;">
             <h3>Operating Expenses</h3>
             <h2>{total_expenses:,.2f} DZD</h2>
         </div>
-        <div style="background-color: #17a2b8; color: white; padding: 20px; border-radius: 8px; flex: 1;">
+        <div style="background-color: #17a2b8; color: white; padding: 20px; border-radius: 8px; flex: 1; min-width: 200px;">
             <h3>Net Profit Balance</h3>
             <h2>{net_profit:,.2f} DZD</h2>
         </div>
-        <div style="background-color: #6c757d; color: white; padding: 20px; border-radius: 8px; flex: 1;">
-            <h3>Stock Asset Valuation</h3>
+        <div style="background-color: #6c757d; color: white; padding: 20px; border-radius: 8px; flex: 1; min-width: 200px;">
+            <h3>Stock Valuation</h3>
             <h2>{inventory_cogs:,.2f} DZD</h2>
         </div>
     </div>
     """)
 
 # ------------------------------------------------------------------------------
-# REPORTLAB PDF GENERATION
+# PDF INVOICE EXPORT
 # ------------------------------------------------------------------------------
 def generate_sales_pdf(item_name, qty, unit_price, total_price):
     buffer = BytesIO()
@@ -503,23 +516,25 @@ def generate_sales_pdf(item_name, qty, unit_price, total_price):
     doc.build(story)
     pdf_data = buffer.getvalue()
     
-    import pywebio.output as pyo
-    pyo.download("receipt.pdf", pdf_data)
+    download("receipt.pdf", pdf_data)
     put_success("PDF Receipt Generated and Downloaded!")
 
 # ------------------------------------------------------------------------------
-# MAIN ROUTING ENTRY
+# MAIN APPLICATION ROUTER & DASHBOARD
 # ------------------------------------------------------------------------------
 def main_menu():
-    if CURRENT_USER['username'] is None:
+    username = getattr(session_local, 'username', None)
+    role = getattr(session_local, 'role', None)
+    
+    if not username:
         login_page()
         return
 
     clear()
     set_env(title="Luxury Impact Parfume Rz - Operational Control")
     
-    put_markdown(f"# 💎 Luxury Impact Parfume Rz Portal")
-    put_markdown(f"**Active Session:** `{CURRENT_USER['username']}` | **Role:** `{CURRENT_USER['role']}`")
+    put_markdown("# 💎 Luxury Impact Parfume Rz Portal")
+    put_markdown(f"**Active Session:** `{username}` | **Role:** `{role}`")
     
     put_buttons([
         {"label": "📦 Inventory & Fragrances", "value": "inventory", "color": "primary"},
@@ -539,11 +554,11 @@ def handle_dashboard_action(action):
         logout()
 
 # ------------------------------------------------------------------------------
-# FLASK APP SETUP & ROUTING REGISTRATION
+# FLASK & WSGI BINDING (FOR RENDER / GUNICORN)
 # ------------------------------------------------------------------------------
 app = Flask(__name__)
 
-# Register PyWebIO URL view
+# Bind PyWebIO entrypoint
 app.add_url_rule(
     '/',
     endpoint='webio_view',
@@ -551,16 +566,15 @@ app.add_url_rule(
     methods=['GET', 'POST', 'OPTIONS']
 )
 
-# Gunicorn Attribute Alias (Required so Gunicorn main:flask_app finds it)
+# Gunicorn Attribute Target Alias
 flask_app = app
 
-# Local Browser Helper
 def open_browser():
-    """Opens default web browser for local execution."""
+    """Opens default browser only when running locally."""
     time.sleep(1.5)
     webbrowser.open(f"http://localhost:{PORT}")
 
-# Local Server Entrypoint
 if __name__ == '__main__':
+    # Threaded browser opener for local testing
     threading.Thread(target=open_browser, daemon=True).start()
     app.run(host='0.0.0.0', port=PORT, debug=True)
