@@ -7,10 +7,8 @@ import base64
 from io import BytesIO
 import threading
 import webbrowser
-from datetime import datetime
 
-import qrcode
-from flask import Flask, request
+from flask import Flask
 from pywebio.platform.flask import webio_view
 from pywebio import start_server
 from pywebio.session import local as session_local
@@ -18,11 +16,10 @@ from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT,
 from pywebio.output import (
     clear, put_html, put_table, put_buttons, toast, download
 )
-from werkzeug.security import generate_password_hash, check_password_hash
 from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 # --- Configuration & Constants ---
 
@@ -31,18 +28,17 @@ PORT = 8080
 STORE_BRAND = "Luxury Impact Parfum RZ"
 
 CURRENCIES = {
-    "DZD (د.ج)": {"rate": 220.0, "symbol": "د.ج", "pdf_symbol": "DZD"},
-    "EUR (€)": {"rate": 1.0, "symbol": "€", "pdf_symbol": "EUR"},
-    "USD ($)": {"rate": 1.08, "symbol": "$", "pdf_symbol": "USD"}
+    "EUR (€)": {"rate": 1.0, "symbol": "€"},
+    "USD ($)": {"rate": 1.08, "symbol": "$"},
+    "DZD (د.ج)": {"rate": 220.0, "symbol": "د.ج"}
 }
 
-# --- Database Initialization ---
+# --- Database Security Initialization ---
 
 def get_db_connection():
     """Returns a thread-safe connection to the SQLite database."""
     conn = sqlite3.connect(DB_NAME, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 def init_db():
@@ -54,10 +50,7 @@ def init_db():
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
                 name TEXT NOT NULL,
-                role TEXT DEFAULT 'user',
-                created_ip TEXT,
-                user_agent TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                role TEXT DEFAULT 'user'
             )
         """)
         conn.execute("""
@@ -89,18 +82,23 @@ init_db()
 # --- Session Helpers & Security Decorators ---
 
 def get_current_user():
+    """Retrieves session-isolated user dict."""
     return getattr(session_local, 'user', None)
 
 def set_current_user(user_dict):
+    """Sets session-isolated user dict."""
     session_local.user = user_dict
 
 def get_selected_currency():
-    return getattr(session_local, 'currency', "DZD (د.ج)")
+    """Retrieves session-isolated selected currency."""
+    return getattr(session_local, 'currency', "EUR (€)")
 
 def set_selected_currency(currency_code):
+    """Sets session-isolated currency."""
     session_local.currency = currency_code
 
 def require_auth(func):
+    """Decorator ensuring that only authenticated users access the route."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if not get_current_user():
@@ -111,6 +109,7 @@ def require_auth(func):
     return wrapper
 
 def require_admin(func):
+    """Decorator ensuring that only users with 'admin' role access the route."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         user = get_current_user()
@@ -121,9 +120,10 @@ def require_admin(func):
         return func(*args, **kwargs)
     return wrapper
 
-# --- Conversion & Image Helpers ---
+# --- Conversion Helpers ---
 
 def convert_price(amount, from_curr, to_curr):
+    """Calculates rates accurately from EUR base rate."""
     if from_curr not in CURRENCIES or to_curr not in CURRENCIES:
         return amount
     eur_amount = amount / CURRENCIES[from_curr]["rate"]
@@ -142,23 +142,6 @@ def get_image_source(img_path):
         return img_path
     return "https://via.placeholder.com/150?text=No+Image"
 
-def generate_qr_code_stream(data_text):
-    """Generates an in-memory PNG QR Code stream."""
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=4,
-        border=2,
-    )
-    qr.add_data(data_text)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    
-    img_buffer = BytesIO()
-    img.save(img_buffer, format="PNG")
-    img_buffer.seek(0)
-    return img_buffer
-
 def render_header(subtitle=""):
     put_html(f"""
         <div style="background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); color: white; padding: 20px; border-radius: 12px; margin-bottom: 25px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
@@ -174,25 +157,6 @@ def render_footer():
         </div>
     """)
 
-# --- Currency Selection Step ---
-
-@require_auth
-def select_currency_once_page():
-    clear()
-    render_header("إعداد عملة التسوق للجلسة")
-
-    data = input_group("اختيار العملة", [
-        select("اختر عملة التسوق التي تود اعتمادها طوال هذه الجلسة:", 
-               list(CURRENCIES.keys()), 
-               value=get_selected_currency(), 
-               name="currency")
-    ])
-    
-    curr_choice = data["currency"]
-    set_selected_currency(curr_choice)
-    toast(f"تمت تهيئة عملة التسوق بنجاح: {curr_choice}", color="success")
-    main_menu()
-
 # --- Main Flow & Views ---
 
 def main_menu():
@@ -204,11 +168,13 @@ def main_menu():
 
     user_info_html = ""
     if current_user:
-        user_info_html = f"""
-            <div style='text-align: center; margin-bottom: 15px; background: #edf2f7; padding: 10px; border-radius: 8px;'>
-                <b>المستخدم الحالي:</b> {current_user['name']} ({current_user['role']}) | <b>العملة المعتمدة:</b> {current_currency}
-            </div>
-        """
+        user_info_html = f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']})</div>"
+
+    # Currency selection persistence in active session
+    curr_select = select("اختر عملة العرض والتسوق الخاصة بك:", list(CURRENCIES.keys()), value=current_currency)
+    if curr_select != current_currency:
+        set_selected_currency(curr_select)
+        toast(f"تم اعتماد عملة التسوق: {curr_select}", color="info")
 
     put_html(user_info_html)
 
@@ -217,7 +183,7 @@ def main_menu():
     if current_user:
         options.append({'label': '🛒 سلة التسوق', 'value': 'cart', 'color': 'success'})
         if current_user['role'] == 'admin':
-            options.append({'label': '⚙️ لوحة التحكم واستعراض السجلات', 'value': 'admin', 'color': 'warning'})
+            options.append({'label': '⚙️ لوحة التحكم', 'value': 'admin', 'color': 'warning'})
         options.append({'label': '🚪 تسجيل الخروج', 'value': 'logout', 'color': 'danger'})
     else:
         options.append({'label': '🔑 تسجيل الدخول', 'value': 'login', 'color': 'info'})
@@ -235,11 +201,11 @@ def main_menu():
         toast("تم تسجيل الخروج وتأمين الجلسة بنجاح.", color="info")
         main_menu()
 
-# --- Registration & Authentication ---
+# --- Auth System ---
 
 def register_page():
     clear()
-    render_header("إنشاء حساب جديد وتوثيق بيانات الأمان")
+    render_header("إنشاء حساب جديد")
 
     data = input_group("تسجيل حساب جديد", [
         input("الاسم الكامل", name="name", required=True),
@@ -248,27 +214,15 @@ def register_page():
         select("نوع الحساب", [("مستخدم عادي", "user"), ("مدير النظام", "admin")], name="role")
     ])
 
-    client_ip = "127.0.0.1"
-    user_agent = "Unknown Browser"
-    try:
-        if request:
-            client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-            user_agent = request.headers.get('User-Agent', 'Unknown Browser')
-    except RuntimeError:
-        pass
-
-    hashed_password = generate_password_hash(data['password'].strip())
-
     with get_db_connection() as conn:
         cursor = conn.cursor()
         try:
             cursor.execute(
-                """INSERT INTO users (name, username, password, role, created_ip, user_agent) 
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (data['name'].strip(), data['username'].strip(), hashed_password, data['role'], client_ip, user_agent)
+                "INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)",
+                (data['name'].strip(), data['username'].strip(), data['password'].strip(), data['role'])
             )
             conn.commit()
-            toast("تم إنشاء الحساب بنجاح وتشفير بيانات الاعتماد!", color="success")
+            toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
             login_page()
         except sqlite3.IntegrityError:
             toast("اسم المستخدم هذا مستخدم بالفعل. يرجى اختيار اسم آخر.", color="error")
@@ -286,21 +240,21 @@ def login_page():
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, name, username, password, role FROM users WHERE username = ?", 
-            (data['username'].strip(),)
+            "SELECT id, name, username, role FROM users WHERE username = ? AND password = ?", 
+            (data['username'].strip(), data['password'].strip())
         )
         user = cursor.fetchone()
 
-    if user and check_password_hash(user['password'], data['password'].strip()):
+    if user:
         user_dict = {'id': user['id'], 'name': user['name'], 'username': user['username'], 'role': user['role']}
         set_current_user(user_dict)
-        toast(f"مرحباً بك {user['name']}!", color="success")
-        select_currency_once_page()
+        toast(f"مرحباً بك {user['name']}! تم توثيق دخولك بنجاح.", color="success")
+        main_menu()
     else:
         toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
-# --- Store & Cart Views ---
+# --- Protected Store & Cart Views ---
 
 def user_shop():
     clear()
@@ -397,7 +351,7 @@ def view_cart():
 
         for item in items:
             name, base_price, quantity, img_path, orig_currency = item['name'], item['price'], item['quantity'], item['image'], item['currency']
-            item_currency = orig_currency if orig_currency else "DZD (د.ج)"
+            item_currency = orig_currency if orig_currency else "EUR (€)"
             
             converted_unit_price = convert_price(base_price, item_currency, selected_currency)
             total_item_price = converted_unit_price * quantity
@@ -422,7 +376,7 @@ def view_cart():
         """)
 
     act = actions("الخيارات المتاحة:", [
-        {'label': '📄 تحميل الفاتورة + QR Code (PDF)', 'value': 'pdf', 'color': 'success'},
+        {'label': '📄 تحميل الفاتورة (PDF)', 'value': 'pdf', 'color': 'success'},
         {'label': '🗑️ تفريغ السلة', 'value': 'clear_cart', 'color': 'danger'},
         {'label': '🛍️ مواصلة التسوق', 'value': 'shop', 'color': 'primary'},
         {'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
@@ -450,7 +404,6 @@ def generate_pdf_invoice():
     current_user = get_current_user()
     selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
-    pdf_symbol = curr_info.get("pdf_symbol", "DZD")
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -483,28 +436,25 @@ def generate_pdf_invoice():
     story.append(Paragraph(f"<b>{STORE_BRAND}</b>", title_style))
     story.append(Spacer(1, 4))
     story.append(Paragraph("OFFICIAL INVOICE / RECEIPT", normal_style))
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 15))
 
-    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    customer_info = f"Customer ID: {current_user['username']} | Date: {timestamp_str} | Currency: {pdf_symbol}"
+    customer_info = f"Customer: {current_user['name']} | Currency: {selected_currency}"
     story.append(Paragraph(customer_info, normal_style))
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 15))
 
     data = [["Item Description", "Price", "Qty", "Total"]]
     grand_total = 0.0
 
     for item in items:
         name, base_price, qty, orig_curr = item['name'], item['price'], item['quantity'], item['currency']
-        item_curr = orig_curr if orig_curr else "DZD (د.ج)"
+        item_curr = orig_curr if orig_curr else "EUR (€)"
         
         price = convert_price(base_price, item_curr, selected_currency)
         total = price * qty
         grand_total += total
-        
-        safe_item_name = name.encode('ascii', 'ignore').decode('ascii') or "Parfum Product"
-        data.append([safe_item_name, f"{price:,.2f} {pdf_symbol}", str(qty), f"{total:,.2f} {pdf_symbol}"])
+        data.append([name, f"{price:,.2f} {curr_info['symbol']}", str(qty), f"{total:,.2f} {curr_info['symbol']}"])
 
-    data.append(["Grand Total", "", "", f"{grand_total:,.2f} {pdf_symbol}"])
+    data.append(["Grand Total", "", "", f"{grand_total:,.2f} {curr_info['symbol']}"])
 
     t = Table(data, colWidths=[140, 70, 30, 80])
     t.setStyle(TableStyle([
@@ -520,23 +470,7 @@ def generate_pdf_invoice():
     ]))
 
     story.append(t)
-    story.append(Spacer(1, 15))
-
-    # --- Generate & Render QR Code ---
-    qr_payload = (
-        f"Brand: {STORE_BRAND}\n"
-        f"User: {current_user['username']}\n"
-        f"Total: {grand_total:,.2f} {pdf_symbol}\n"
-        f"Date: {timestamp_str}"
-    )
-    qr_stream = generate_qr_code_stream(qr_payload)
-    qr_image = RLImage(qr_stream, width=90, height=90)
-    qr_image.hAlign = 'CENTER'
-    
-    story.append(qr_image)
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Scan QR Code to verify receipt authenticity", normal_style))
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 20))
     story.append(Paragraph("Thank you for choosing Luxury Impact Parfum RZ!", normal_style))
 
     doc.build(story)
@@ -544,55 +478,26 @@ def generate_pdf_invoice():
     buffer.close()
 
     download("Invoice_Parfum_RZ.pdf", pdf_data)
-    toast("تم تحميل الفاتورة الموثقة بـ QR Code بنجاح!", color="success")
+    toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Admin Dashboard & Product Management ---
+# --- Protected Admin Dashboard ---
 
 @require_admin
 def admin_dashboard():
     clear()
-    render_header("لوحة التحكم وإدارة الأمان")
+    render_header("لوحة التحكم وإدارة العطور")
+
+    put_html("<h2 style='color: #1a202c; text-align: center; font-weight: 900; font-size: 24px;'>⚙️ لوحة إدارة المتجر</h2>")
 
     choice = actions("اختر العملية المطلوبة:", [
-        {'label': '🛡️ سجل أمان الحسابات (IP & User-Agent)', 'value': 'audit_log', 'color': 'danger'},
         {'label': '➕ إضافة عطر جديد', 'value': 'add', 'color': 'success'},
         {'label': '📋 عرض وتعديل قائمة العطور', 'value': 'list', 'color': 'primary'},
         {'label': '🔙 العودة للقائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
     ])
 
-    if choice == 'audit_log': view_security_logs_page(); return
-    elif choice == 'add': add_product_page(); return
+    if choice == 'add': add_product_page(); return
     elif choice == 'list': list_products_page(); return
     elif choice == 'home': main_menu(); return
-
-@require_admin
-def view_security_logs_page():
-    clear()
-    render_header("سجل أمان الحسابات المسجلة")
-
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, username, name, role, created_ip, user_agent, created_at FROM users")
-        users = cursor.fetchall()
-
-    if not users:
-        put_html("<p style='text-align:center;'>لا يوجد مستخدمون في قاعدة البيانات.</p>")
-    else:
-        table_data = [["المعرف", "اسم المستخدم", "الاسم الكامل", "الرتبة", "IP Address", "User-Agent", "تاريخ التسجيل"]]
-        for u in users:
-            table_data.append([
-                str(u['id']),
-                u['username'],
-                u['name'],
-                u['role'],
-                u['created_ip'] or "N/A",
-                u['user_agent'] or "N/A",
-                u['created_at'] or "N/A"
-            ])
-        put_table(table_data)
-
-    act = actions("", [{'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'}])
-    if act == 'admin': admin_dashboard()
 
 @require_admin
 def add_product_page():
@@ -602,7 +507,7 @@ def add_product_page():
     data = input_group("إضافة عطر جديد", [
         input("اسم العطر", name="name", required=True),
         input("السعر", name="price", type=NUMBER, required=True),
-        select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="DZD (د.ج)"),
+        select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="EUR (€)"),
         file_upload("صورة العطر", name="image", accept="image/*", required=True)
     ])
 
@@ -712,17 +617,16 @@ def edit_product_page(product_id):
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- App Engine Setup ---
+# --- WSGI App Setup ---
 
 app = Flask(__name__)
 app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
 
+flask_app = app
+
 def open_browser():
     time.sleep(1.5)
     webbrowser.open(f"http://localhost:{PORT}")
-
-app = Flask(__name__)
-flask_app = app  # Exposes 'flask_app' for Gunicorn import
 
 if __name__ == '__main__':
     threading.Thread(target=open_browser, daemon=True).start()
