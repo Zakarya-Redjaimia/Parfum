@@ -1,24 +1,30 @@
 import sqlite3
 import os
 import sys
+import time
+import threading
+import webbrowser
 import hashlib
 from io import BytesIO
 from datetime import datetime
 
-# PyWebIO Imports
+# Flask & PyWebIO Integration
+from flask import Flask
+from pywebio.platform.flask import webio_view
+
+# PyWebIO UI Imports
 import pywebio
-from pywebio import start_server
-from pywebio.input import input, select, input_group, ACTIONS, TEXT, NUMBER, PASSWORD
+from pywebio.input import input, select, input_group, TEXT, NUMBER, PASSWORD
 from pywebio.output import (
     put_text, put_markdown, put_table, put_buttons, put_button,
-    put_html, put_code, popup, close_popup, clear, put_success,
-    put_warning, put_error, put_loading, put_image
+    put_html, popup, close_popup, clear, put_success, put_warning,
+    put_error, put_info, put_image
 )
-from pywebio.session import run_js, set_env
+from pywebio.session import set_env
 
 # ReportLab Imports for PDF Generation
-from reportlab.lib.pagesizes import letter, A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
@@ -26,10 +32,14 @@ from reportlab.lib import colors
 import qrcode
 
 # ------------------------------------------------------------------------------
-# DATABASE INITIALIZATION & CONFIGURATION
+# ENVIRONMENT & PORT CONFIGURATION
 # ------------------------------------------------------------------------------
+PORT = int(os.environ.get("PORT", 8080))
 DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "store.db")
 
+# ------------------------------------------------------------------------------
+# DATABASE INITIALIZATION
+# ------------------------------------------------------------------------------
 def get_db():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -90,7 +100,7 @@ def init_db():
         )
     ''')
     
-    # Create default admin if no users exist
+    # Create default admin user if database is empty
     cursor.execute('SELECT COUNT(*) FROM users')
     if cursor.fetchone()[0] == 0:
         admin_pass_hash = hashlib.sha256("admin123".encode()).hexdigest()
@@ -102,11 +112,11 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Auto-initialize database on import/boot
+# Auto-execute DB initialization at module load time for Gunicorn boot
 init_db()
 
 # ------------------------------------------------------------------------------
-# AUTHENTICATION & SESSION MANAGEMENT
+# AUTHENTICATION & SESSION STATE
 # ------------------------------------------------------------------------------
 CURRENT_USER = {"username": None, "role": None}
 
@@ -141,7 +151,7 @@ def login_page():
         CURRENT_USER['username'] = user['username']
         CURRENT_USER['role'] = user['role']
         put_success(f"Welcome back, {user['username']}!")
-        main_dashboard()
+        main_menu()
     else:
         put_error("Invalid username or password.")
         put_button("Try Again", onclick=login_page)
@@ -197,7 +207,7 @@ def inventory_view():
     put_buttons([
         {"label": "+ Add New Perfume", "value": "add", "color": "success"},
         {"label": "📊 Main Menu", "value": "menu", "color": "secondary"}
-    ], onclick=lambda btn: add_perfume_form() if btn == "add" else main_dashboard())
+    ], onclick=lambda btn: add_perfume_form() if btn == "add" else main_menu())
     
     conn = get_db()
     cursor = conn.cursor()
@@ -282,7 +292,7 @@ def delete_perfume(perfume_id):
     inventory_view()
 
 # ------------------------------------------------------------------------------
-# QR CODE GENERATION & DISCOVERY TOOL
+# QR CODE GENERATION
 # ------------------------------------------------------------------------------
 def generate_perfume_qr(perfume_id):
     conn = get_db()
@@ -322,7 +332,7 @@ def generate_perfume_qr(perfume_id):
     ])
 
 # ------------------------------------------------------------------------------
-# POS / SALES MANAGEMENT
+# POINT OF SALE (POS)
 # ------------------------------------------------------------------------------
 def process_sale_view():
     clear()
@@ -336,7 +346,7 @@ def process_sale_view():
     
     if not items:
         put_warning("No items in stock available for sale!")
-        put_button("Back to Dashboard", onclick=main_dashboard)
+        put_button("Back to Dashboard", onclick=main_menu)
         return
         
     item_options = [{"label": f"{i['name']} (In Stock: {i['stock_qty']}) - {i['selling_price']} DZD", "value": i['id']} for i in items]
@@ -379,10 +389,10 @@ def process_sale_view():
         {"label": "📄 Print PDF Invoice", "value": "pdf", "color": "primary"},
         {"label": "New Sale", "value": "new", "color": "success"},
         {"label": "Main Dashboard", "value": "dashboard", "color": "secondary"}
-    ], onclick=lambda btn: generate_sales_pdf(perfume['name'], qty, unit_price, total_price) if btn == "pdf" else (process_sale_view() if btn == "new" else main_dashboard()))
+    ], onclick=lambda btn: generate_sales_pdf(perfume['name'], qty, unit_price, total_price) if btn == "pdf" else (process_sale_view() if btn == "new" else main_menu()))
 
 # ------------------------------------------------------------------------------
-# FINANCIALS, EXPENSES & REPORTING
+# FINANCIALS & EXPENSES
 # ------------------------------------------------------------------------------
 def add_expense():
     clear()
@@ -412,25 +422,21 @@ def financial_overview():
     put_buttons([
         {"label": "+ Add Expense", "value": "exp", "color": "warning"},
         {"label": "📊 Main Menu", "value": "menu", "color": "secondary"}
-    ], onclick=lambda btn: add_expense() if btn == "exp" else main_dashboard())
+    ], onclick=lambda btn: add_expense() if btn == "exp" else main_menu())
     
     conn = get_db()
     cursor = conn.cursor()
     
-    # Calculate Total Revenue
     cursor.execute('SELECT SUM(total_price) FROM sales')
     total_revenue = cursor.fetchone()[0] or 0.0
     
-    # Calculate Total Expenses
     cursor.execute('SELECT SUM(amount) FROM expenses')
     total_expenses = cursor.fetchone()[0] or 0.0
     
-    # Calculate Inventory COGS Valuation
     cursor.execute('SELECT SUM(stock_qty * purchase_price) FROM perfumes')
     inventory_cogs = cursor.fetchone()[0] or 0.0
     
     net_profit = total_revenue - total_expenses
-    
     conn.close()
     
     put_html(f"""
@@ -455,7 +461,7 @@ def financial_overview():
     """)
 
 # ------------------------------------------------------------------------------
-# REPORTLAB PDF GENERATION ENGINE
+# REPORTLAB PDF GENERATION
 # ------------------------------------------------------------------------------
 def generate_sales_pdf(item_name, qty, unit_price, total_price):
     buffer = BytesIO()
@@ -464,7 +470,6 @@ def generate_sales_pdf(item_name, qty, unit_price, total_price):
     
     story = []
     
-    # PDF Header
     title_style = ParagraphStyle(
         'TitleStyle',
         parent=styles['Heading1'],
@@ -476,7 +481,6 @@ def generate_sales_pdf(item_name, qty, unit_price, total_price):
     story.append(Paragraph(f"Official Transaction Receipt - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
     story.append(Spacer(1, 20))
     
-    # Invoice Data Table
     table_data = [
         ["Description / Item", "Quantity", "Unit Price", "Total Amount"],
         [item_name, str(qty), f"{unit_price:.2f} DZD", f"{total_price:.2f} DZD"]
@@ -501,12 +505,16 @@ def generate_sales_pdf(item_name, qty, unit_price, total_price):
     
     import pywebio.output as pyo
     pyo.download("receipt.pdf", pdf_data)
-    put_success("PDF Receipt Generated and Download triggered!")
+    put_success("PDF Receipt Generated and Downloaded!")
 
 # ------------------------------------------------------------------------------
-# MAIN DASHBOARD / WORKFLOW ROUTER
+# MAIN ROUTING ENTRY
 # ------------------------------------------------------------------------------
-def main_dashboard():
+def main_menu():
+    if CURRENT_USER['username'] is None:
+        login_page()
+        return
+
     clear()
     set_env(title="Luxury Impact Parfume Rz - Operational Control")
     
@@ -530,21 +538,29 @@ def handle_dashboard_action(action):
     elif action == "logout":
         logout()
 
-def auth_menu():
-    if CURRENT_USER['username'] is None:
-        login_page()
-    else:
-        main_dashboard()
+# ------------------------------------------------------------------------------
+# FLASK APP SETUP & ROUTING REGISTRATION
+# ------------------------------------------------------------------------------
+app = Flask(__name__)
 
-# ------------------------------------------------------------------------------
-# APPLICATION ENTRYPOINT FOR RENDER DEPLOYMENT
-# ------------------------------------------------------------------------------
-if __name__ == "__main__":
-    # Ensure database is provisioned on boot
-    init_db()
-    
-    # Read dynamic host port provided by Render environment
-    port = int(os.environ.get("PORT", 8080))
-    
-    # Run natively through PyWebIO server engine to maintain session events/buttons
-    start_server(auth_menu, port=port, host="0.0.0.0", debug=False)
+# Register PyWebIO URL view
+app.add_url_rule(
+    '/',
+    endpoint='webio_view',
+    view_func=webio_view(main_menu),
+    methods=['GET', 'POST', 'OPTIONS']
+)
+
+# Gunicorn Attribute Alias (Required so Gunicorn main:flask_app finds it)
+flask_app = app
+
+# Local Browser Helper
+def open_browser():
+    """Opens default web browser for local execution."""
+    time.sleep(1.5)
+    webbrowser.open(f"http://localhost:{PORT}")
+
+# Local Server Entrypoint
+if __name__ == '__main__':
+    threading.Thread(target=open_browser, daemon=True).start()
+    app.run(host='0.0.0.0', port=PORT, debug=True)
