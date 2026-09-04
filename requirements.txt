@@ -11,3 +11,4 @@ gunicorn
 flask
 werkzeug
 gevent
+packaging
