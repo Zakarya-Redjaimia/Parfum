@@ -29,17 +29,18 @@ PORT = 8080
 STORE_BRAND = "Luxury Impact Parfum RZ"
 
 CURRENCIES = {
-    "EUR (€)": {"rate": 1.0, "symbol": "€"},
-    "USD ($)": {"rate": 1.08, "symbol": "$"},
-    "DZD (د.ج)": {"rate": 220.0, "symbol": "د.ج"}
+    "DZD (د.ج)": {"rate": 220.0, "symbol": "د.ج", "pdf_symbol": "DZD"},
+    "EUR (€)": {"rate": 1.0, "symbol": "€", "pdf_symbol": "EUR"},
+    "USD ($)": {"rate": 1.08, "symbol": "$", "pdf_symbol": "USD"}
 }
 
-# --- Database Security Initialization ---
+# --- Database Initialization ---
 
 def get_db_connection():
     """Returns a thread-safe connection to the SQLite database."""
     conn = sqlite3.connect(DB_NAME, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 def init_db():
@@ -92,7 +93,7 @@ def set_current_user(user_dict):
     session_local.user = user_dict
 
 def get_selected_currency():
-    return getattr(session_local, 'currency', "EUR (€)")
+    return getattr(session_local, 'currency', "DZD (د.ج)")
 
 def set_selected_currency(currency_code):
     session_local.currency = currency_code
@@ -154,19 +155,21 @@ def render_footer():
         </div>
     """)
 
-# --- Currency Selection Step (Executed Once After Login) ---
+# --- Currency Selection Step ---
 
 @require_auth
 def select_currency_once_page():
     clear()
     render_header("إعداد عملة التسوق للجلسة")
 
-    curr_choice = select(
-        "اختر عملة التسوق التي تود اعتمادها طوال هذه الجلسة:", 
-        list(CURRENCIES.keys()), 
-        value=get_selected_currency()
-    )
+    data = input_group("اختيار العملة", [
+        select("اختر عملة التسوق التي تود اعتمادها طوال هذه الجلسة:", 
+               list(CURRENCIES.keys()), 
+               value=get_selected_currency(), 
+               name="currency")
+    ])
     
+    curr_choice = data["currency"]
     set_selected_currency(curr_choice)
     toast(f"تمت تهيئة عملة التسوق بنجاح: {curr_choice}", color="success")
     main_menu()
@@ -213,7 +216,7 @@ def main_menu():
         toast("تم تسجيل الخروج وتأمين الجلسة بنجاح.", color="info")
         main_menu()
 
-# --- Security & Registration System ---
+# --- Registration & Authentication ---
 
 def register_page():
     clear()
@@ -226,11 +229,15 @@ def register_page():
         select("نوع الحساب", [("مستخدم عادي", "user"), ("مدير النظام", "admin")], name="role")
     ])
 
-    # Capturing Client IP and User-Agent Securely
-    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    user_agent = request.headers.get('User-Agent', 'Unknown Browser')
+    client_ip = "127.0.0.1"
+    user_agent = "Unknown Browser"
+    try:
+        if request:
+            client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+            user_agent = request.headers.get('User-Agent', 'Unknown Browser')
+    except RuntimeError:
+        pass
 
-    # Hash the password before storing
     hashed_password = generate_password_hash(data['password'].strip())
 
     with get_db_connection() as conn:
@@ -265,13 +272,10 @@ def login_page():
         )
         user = cursor.fetchone()
 
-    # Validate Hashed Password
     if user and check_password_hash(user['password'], data['password'].strip()):
         user_dict = {'id': user['id'], 'name': user['name'], 'username': user['username'], 'role': user['role']}
         set_current_user(user_dict)
         toast(f"مرحباً بك {user['name']}!", color="success")
-        
-        # Mandatory: Choose Currency Once Immediately After Login
         select_currency_once_page()
     else:
         toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
@@ -374,7 +378,7 @@ def view_cart():
 
         for item in items:
             name, base_price, quantity, img_path, orig_currency = item['name'], item['price'], item['quantity'], item['image'], item['currency']
-            item_currency = orig_currency if orig_currency else "EUR (€)"
+            item_currency = orig_currency if orig_currency else "DZD (د.ج)"
             
             converted_unit_price = convert_price(base_price, item_currency, selected_currency)
             total_item_price = converted_unit_price * quantity
@@ -427,6 +431,7 @@ def generate_pdf_invoice():
     current_user = get_current_user()
     selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
+    pdf_symbol = curr_info.get("pdf_symbol", "DZD")
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -461,7 +466,7 @@ def generate_pdf_invoice():
     story.append(Paragraph("OFFICIAL INVOICE / RECEIPT", normal_style))
     story.append(Spacer(1, 15))
 
-    customer_info = f"Customer: {current_user['name']} | Currency: {selected_currency}"
+    customer_info = f"Customer ID: {current_user['username']} | Currency: {pdf_symbol}"
     story.append(Paragraph(customer_info, normal_style))
     story.append(Spacer(1, 15))
 
@@ -470,14 +475,17 @@ def generate_pdf_invoice():
 
     for item in items:
         name, base_price, qty, orig_curr = item['name'], item['price'], item['quantity'], item['currency']
-        item_curr = orig_curr if orig_curr else "EUR (€)"
+        item_curr = orig_curr if orig_curr else "DZD (د.ج)"
         
         price = convert_price(base_price, item_curr, selected_currency)
         total = price * qty
         grand_total += total
-        data.append([name, f"{price:,.2f} {curr_info['symbol']}", str(qty), f"{total:,.2f} {curr_info['symbol']}"])
+        
+        # Clean item name for Standard Helvetica encoding
+        safe_item_name = name.encode('ascii', 'ignore').decode('ascii') or "Parfum Product"
+        data.append([safe_item_name, f"{price:,.2f} {pdf_symbol}", str(qty), f"{total:,.2f} {pdf_symbol}"])
 
-    data.append(["Grand Total", "", "", f"{grand_total:,.2f} {curr_info['symbol']}"])
+    data.append(["Grand Total", "", "", f"{grand_total:,.2f} {pdf_symbol}"])
 
     t = Table(data, colWidths=[140, 70, 30, 80])
     t.setStyle(TableStyle([
@@ -503,7 +511,7 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", pdf_data)
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Protected Admin Dashboard with Security Audit Logs ---
+# --- Admin Dashboard & Product Management ---
 
 @require_admin
 def admin_dashboard():
@@ -559,7 +567,7 @@ def add_product_page():
     data = input_group("إضافة عطر جديد", [
         input("اسم العطر", name="name", required=True),
         input("السعر", name="price", type=NUMBER, required=True),
-        select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="EUR (€)"),
+        select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="DZD (د.ج)"),
         file_upload("صورة العطر", name="image", accept="image/*", required=True)
     ])
 
@@ -669,12 +677,10 @@ def edit_product_page(product_id):
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- WSGI App Setup ---
+# --- App Engine Setup ---
 
 app = Flask(__name__)
 app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
-
-flask_app = app
 
 def open_browser():
     time.sleep(1.5)
