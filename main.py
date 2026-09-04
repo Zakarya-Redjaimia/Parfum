@@ -28,9 +28,9 @@ PORT = 8080
 STORE_BRAND = "Luxury Impact Parfum RZ"
 
 CURRENCIES = {
+    "DA (د.ج)": {"rate": 220.0, "symbol": "DA"},
     "EUR (€)": {"rate": 1.0, "symbol": "€"},
-    "USD ($)": {"rate": 1.08, "symbol": "$"},
-    "DZD (د.ج)": {"rate": 220.0, "symbol": "د.ج"}
+    "USD ($)": {"rate": 1.08, "symbol": "$"}
 }
 
 # --- Database Security Initialization ---
@@ -91,7 +91,7 @@ def set_current_user(user_dict):
 
 def get_selected_currency():
     """Retrieves session-isolated selected currency."""
-    return getattr(session_local, 'currency', "EUR (€)")
+    return getattr(session_local, 'currency', "DA (د.ج)")
 
 def set_selected_currency(currency_code):
     """Sets session-isolated currency."""
@@ -168,13 +168,7 @@ def main_menu():
 
     user_info_html = ""
     if current_user:
-        user_info_html = f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']})</div>"
-
-    # Currency selection persistence in active session
-    curr_select = select("اختر عملة العرض والتسوق الخاصة بك:", list(CURRENCIES.keys()), value=current_currency)
-    if curr_select != current_currency:
-        set_selected_currency(curr_select)
-        toast(f"تم اعتماد عملة التسوق: {curr_select}", color="info")
+        user_info_html = f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>العملة الحالية:</b> {current_currency}</div>"
 
     put_html(user_info_html)
 
@@ -248,7 +242,12 @@ def login_page():
     if user:
         user_dict = {'id': user['id'], 'name': user['name'], 'username': user['username'], 'role': user['role']}
         set_current_user(user_dict)
-        toast(f"مرحباً بك {user['name']}! تم توثيق دخولك بنجاح.", color="success")
+        
+        # Immediate post-login currency selection
+        currency_choice = select("اختر عملة التسوق المفضلة لهذا المعرض:", list(CURRENCIES.keys()), value="DA (د.ج)")
+        set_selected_currency(currency_choice)
+        
+        toast(f"مرحباً بك {user['name']}! تم توثيق دخولك واختيار العملة: {currency_choice}", color="success")
         main_menu()
     else:
         toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
@@ -507,7 +506,7 @@ def add_product_page():
     data = input_group("إضافة عطر جديد", [
         input("اسم العطر", name="name", required=True),
         input("السعر", name="price", type=NUMBER, required=True),
-        select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="EUR (€)"),
+        select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="DA (د.ج)"),
         file_upload("صورة العطر", name="image", accept="image/*", required=True)
     ])
 
