@@ -1,153 +1,366 @@
+import base64
 import sqlite3
-import time
 import threading
+import time
 import webbrowser
 from io import BytesIO
+
 from flask import Flask
-from pywebio.platform.flask import webio_view
-from pywebio import start_server
-from pywebio.input import input, select, file_upload, input_group, NUMBER
+from pywebio.input import PASSWORD, NUMBER, file_upload, input, input_group, select
 from pywebio.output import (
-    clear, put_html, put_table, put_buttons, toast, actions, download
+    clear,
+    download,
+    put_buttons,
+    put_html,
+    put_table,
+    toast,
 )
-from reportlab.lib.pagesizes import A5
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from pywebio.platform.flask import webio_view
 from reportlab.lib import colors
+from reportlab.lib.pagesizes import A5
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from werkzeug.security import check_password_hash, generate_password_hash
 
-# --- Application Configurations & State ---
+# --- App Configuration ---
+app = Flask(__name__)
 DB_NAME = "store.db"
+STORE_BRAND = "Luxury Impact Parfume RZ"
 PORT = 8080
-STORE_BRAND = "Luxury Impact Parfum RZ"
 
-current_user = None
+# Global session variables per execution thread
+current_user = None  # Stores dict: {'id': int, 'name': str, 'username': str, 'email': str, 'is_admin': int}
 selected_currency = "USD ($)"
 
 CURRENCIES = {
-    "USD ($)": {"symbol": "$", "rate_from_usd": 1.0},
-    "EUR (€)": {"symbol": "€", "rate_from_usd": 0.92},
-    "DZD (د.ج)": {"symbol": "د.ج", "rate_from_usd": 134.50}
+    "USD ($)": {"symbol": "$", "rate": 1.0},
+    "EUR (€)": {"symbol": "€", "rate": 0.92},
+    "DZD (DA)": {"symbol": "DA", "rate": 134.5},
 }
 
-# --- Helper Functions ---
+
+# --- Database Initialization ---
+def init_db():
+    """Initializes tables for users, products, and cart items."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        
+        # Users table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                is_admin INTEGER DEFAULT 0
+            )
+        """)
+        
+        # Products table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                currency TEXT NOT NULL,
+                image TEXT
+            )
+        """)
+        
+        # Cart table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cart (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                image TEXT,
+                quantity INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        
+        # Seed default Admin account if no users exist
+        cursor.execute("SELECT COUNT(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            admin_pw = generate_password_hash("admin123")
+            cursor.execute("""
+                INSERT INTO users (name, username, email, password, is_admin)
+                VALUES (?, ?, ?, ?, 1)
+            """, ("Administrator", "admin", "admin@luxuryimpact.com", admin_pw))
+            
+        conn.commit()
+
+
+# --- Utilities ---
 def convert_price(amount, from_curr, to_curr):
-    """Converts price from one currency to another using USD base conversion."""
+    """Converts amounts between supported currencies via base USD."""
     if from_curr == to_curr:
         return amount
-    usd_amount = amount / CURRENCIES[from_curr]["rate_from_usd"]
-    return usd_amount * CURRENCIES[to_curr]["rate_from_usd"]
+    base_usd = amount / CURRENCIES[from_curr]["rate"]
+    return base_usd * CURRENCIES[to_curr]["rate"]
+
 
 def get_image_source(img_path):
-    """Returns image path or fallback standard avatar image."""
-    if img_path:
+    """Returns valid image string or a placeholder."""
+    if img_path and (img_path.startswith("data:image") or img_path.startswith("http")):
         return img_path
-    return "https://via.placeholder.com/150?text=Parfum"
+    return "https://via.placeholder.com/150?text=Perfume"
+
 
 def process_and_save_image(file_data):
-    """Placeholder image file processor (returns base64 or file path string)."""
-    if file_data and isinstance(file_data, dict) and file_data.get('content'):
-        # Here you can process or save the file to disc if needed
-        return "https://via.placeholder.com/150?text=Perfume+Image"
-    return "https://via.placeholder.com/150?text=Perfume+Image"
+    """Encodes uploaded images into base64 strings."""
+    if file_data and "content" in file_data:
+        encoded = base64.b64encode(file_data["content"]).decode("utf-8")
+        mime = file_data.get("mime_type", "image/png")
+        return f"data:{mime};base64,{encoded}"
+    return ""
 
-def render_header(title=""):
+
+def render_header(title):
+    """Renders main header with user context and currency indicator."""
+    user_status = f"👤 {current_user['name']}" if current_user else "🔑 Not Logged In"
     put_html(f"""
-        <div style="background-color: #1a202c; padding: 20px; border-radius: 8px; margin-bottom: 20px; text-align: center; color: white;">
-            <h1 style="margin: 0; font-size: 28px;">✨ {STORE_BRAND} ✨</h1>
-            <p style="margin: 5px 0 0 0; color: #cbd5e0;">{title}</p>
+        <div style="background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); color: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; text-align: center;">
+            <div style="float: right; font-size: 12px; opacity: 0.8; font-weight: bold;">{user_status}</div>
+            <h1 style="margin: 0; font-size: 26px; font-weight: 900;">{STORE_BRAND}</h1>
+            <p style="margin: 5px 0 0 0; opacity: 0.8; font-size: 14px;">{title}</p>
         </div>
     """)
+
 
 def render_footer():
+    """Renders application footer."""
     put_html("""
-        <div style="margin-top: 40px; padding: 15px; text-align: center; color: #718096; font-size: 13px; border-top: 1px solid #e2e8f0;">
-            © Luxury Impact Parfum RZ - جميع الحقوق محفوظة
-        </div>
+        <footer style="margin-top: 40px; text-align: center; color: #718096; font-size: 13px;">
+            <p>© 2026 Luxury Impact Parfume RZ. All rights reserved.</p>
+        </footer>
     """)
 
-def login_page():
-    """Dummy login page implementation."""
-    global current_user
-    current_user = {'id': 1, 'name': 'Zakarya'}
-    toast("تم تسجيل الدخول بنجاح!", color="success")
-    main_menu()
 
-def main_menu():
-    """Main landing menu."""
+def actions(label, buttons):
+    """Utility helper for inline action button layouts."""
+    return put_buttons(buttons, onclick=lambda v: v)
+
+
+# --- Authentication Views ---
+def auth_menu():
+    """Account entry menu for registering or logging in."""
     clear()
-    render_header("المتجر الرئيسي")
-    put_html("<h2 style='text-align: center;'>أهلاً بك في متجر العطور الفاخرة</h2>")
-    
-    act = actions("اختر وجهتك:", [
-        {'label': '🛍️ التسوق', 'value': 'shop', 'color': 'primary'},
-        {'label': '🛒 سلة التسوق', 'value': 'cart', 'color': 'info'},
-        {'label': '⚙️ لوحة التحكم', 'value': 'admin', 'color': 'warning'}
+    render_header("مرحباً بك - بوابة الحسابات")
+
+    choice = actions("اختر الإجراء:", [
+        {"label": "🔑 تسجيل الدخول (Login)", "value": "login", "color": "primary"},
+        {"label": "📝 إنشاء حساب جديد (Register)", "value": "register", "color": "success"},
+        {"label": "🛍️ التصفح كزائر", "value": "guest", "color": "secondary"}
     ])
-    
-    if act == 'shop': user_shop()
-    elif act == 'cart': view_cart()
-    elif act == 'admin': admin_dashboard()
+
+    if choice == "login":
+        login_page()
+    elif choice == "register":
+        register_page()
+    elif choice == "guest":
+        main_menu()
+
+
+def register_page():
+    """Handles new user registration."""
+    clear()
+    render_header("إنشاء حساب جديد")
+
+    data = input_group("أدخل بيانات حسابك الجديد", [
+        input("الاسم الكامل", name="name", required=True),
+        input("اسم المستخدم (Username)", name="username", required=True),
+        input("البريد الإلكتروني", name="email", type="email", required=True),
+        input("كلمة المرور", name="password", type=PASSWORD, required=True)
+    ])
+
+    hashed_pw = generate_password_hash(data["password"])
+
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (name, username, email, password, is_admin)
+                VALUES (?, ?, ?, ?, 0)
+            """, (data["name"], data["username"], data["email"], hashed_pw))
+            conn.commit()
+
+        toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
+        login_page()
+    except sqlite3.IntegrityError:
+        toast("اسم المستخدم أو البريد الإلكتروني مسجل بالفعل!", color="error")
+        auth_menu()
+
+
+def login_page():
+    """Handles user authentication."""
+    global current_user
+    clear()
+    render_header("تسجيل الدخول")
+
+    data = input_group("أدخل بيانات الدخول", [
+        input("اسم المستخدم", name="username", required=True),
+        input("كلمة المرور", name="password", type=PASSWORD, required=True)
+    ])
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, username, email, password, is_admin FROM users WHERE username = ?", (data["username"],))
+        user = cursor.fetchone()
+
+    if user and check_password_hash(user[4], data["password"]):
+        current_user = {
+            "id": user[0],
+            "name": user[1],
+            "username": user[2],
+            "email": user[3],
+            "is_admin": user[5]
+        }
+        toast(f"أهلاً بك مجدداً {current_user['name']}!", color="success")
+        main_menu()
+    else:
+        toast("اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
+        auth_menu()
+
+
+def logout():
+    """Clears active session."""
+    global current_user
+    current_user = None
+    toast("تم تسجيل الخروج بنجاح.", color="info")
+    auth_menu()
+
+
+# --- Primary Application Views ---
+def main_menu():
+    """Main dashboard menu."""
+    clear()
+    render_header("الصفحة الرئيسية")
+
+    btn_list = [
+        {"label": "🛍️ تصفح العطور", "value": "shop", "color": "primary"},
+        {"label": "🛒 سلة التسوق", "value": "cart", "color": "success"},
+    ]
+
+    if current_user and current_user["is_admin"] == 1:
+        btn_list.append({"label": "⚙️ لوحة التحكم (Admin)", "value": "admin", "color": "dark"})
+
+    if current_user:
+        btn_list.append({"label": "🚪 تسجيل الخروج", "value": "logout", "color": "danger"})
+    else:
+        btn_list.append({"label": "🔑 تسجيل الدخول", "value": "login", "color": "info"})
+
+    act = actions("القائمة الرئيسية:", btn_list)
+
+    if act == "shop":
+        user_shop()
+    elif act == "cart":
+        view_cart()
+    elif act == "admin":
+        admin_dashboard()
+    elif act == "logout":
+        logout()
+    elif act == "login":
+        auth_menu()
+
+    render_footer()
+
 
 def user_shop():
-    """Dummy user shop catalog view."""
+    """Shop catalogue display."""
     clear()
-    render_header("قائمة العطور المتاحة")
-    put_html("<p style='text-align:center;'>تصفح أحدث منتجاتنا من العطور...</p>")
-    
-    act = actions("خيارات التنقل:", [
-        {'label': '🛒 عرض السلة', 'value': 'cart', 'color': 'info'},
-        {'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
+    render_header("تصفح قائمة العطور")
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products")
+        products = cursor.fetchall()
+
+    curr_info = CURRENCIES[selected_currency]
+
+    if not products:
+        put_html("<div style='background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: 20px auto; text-align: center;'><h3>لا توجد عطور متوفرة حالياً.</h3></div>")
+    else:
+        table_data = [["الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الشراء"]]
+        for prod in products:
+            p_id, name, base_price, item_currency, img_path = prod
+            disp_price = convert_price(base_price, item_currency, selected_currency)
+            img_src = get_image_source(img_path)
+
+            img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
+
+            table_data.append([
+                put_html(img_html),
+                name,
+                f"{disp_price:.2f} {curr_info['symbol']}",
+                put_buttons([{"label": "➕ إضافة للسلة", "value": p_id, "color": "success"}],
+                            onclick=lambda p=p_id: add_to_cart(p, 1))
+            ])
+
+        put_table(table_data)
+
+    act = actions("", [
+        {"label": "🛒 الانتقال للسلة", "value": "view_cart", "color": "primary"},
+        {"label": "🔙 القائمة الرئيسية", "value": "home", "color": "secondary"}
     ])
-    if act == 'cart': view_cart()
-    elif act == 'home': main_menu()
+    if act == "view_cart":
+        view_cart()
+    elif act == "home":
+        main_menu()
 
-# --- Cart Management ---
+    render_footer()
 
-def add_to_cart(product_id, quantity):
+
+def add_to_cart(product_id, quantity=1):
+    """Adds item to cart in database for active user."""
     if not current_user:
-        toast("يرجى تسجيل الدخول أولاً!", color="warning")
-        login_page()
+        toast("يرجى تسجيل الدخول أولاً لتتمكن من الإضافة للسلة!", color="warning")
+        auth_menu()
         return
-        
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
-    product = cursor.fetchone()
-    
-    if product:
-        p_id, name, price_val, prod_currency, image = product
-        base_usd_price = convert_price(price_val, prod_currency, "USD ($)")
-        
-        cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND name = ?", (current_user['id'], name))
-        existing_item = cursor.fetchone()
-        
-        if existing_item:
-            new_qty = existing_item[1] + quantity
-            cursor.execute("UPDATE cart SET quantity = ? WHERE id = ?", (new_qty, existing_item[0]))
-        else:
-            cursor.execute("INSERT INTO cart (user_id, name, price, image, quantity) VALUES (?, ?, ?, ?, ?)",
-                           (current_user['id'], name, base_usd_price, image, quantity))
-                           
-        conn.commit()
-        toast(f"تم إضافة {quantity} من '{name}' إلى السلة بنجاح!", color="success")
-    
-    conn.close()
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
+        product = cursor.fetchone()
+
+        if product:
+            p_id, name, price_val, prod_currency, image = product
+            base_usd_price = convert_price(price_val, prod_currency, "USD ($)")
+
+            cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND name = ?", (current_user["id"], name))
+            existing_item = cursor.fetchone()
+
+            if existing_item:
+                new_qty = existing_item[1] + quantity
+                cursor.execute("UPDATE cart SET quantity = ? WHERE id = ?", (new_qty, existing_item[0]))
+            else:
+                cursor.execute(
+                    "INSERT INTO cart (user_id, name, price, image, quantity) VALUES (?, ?, ?, ?, ?)",
+                    (current_user["id"], name, base_usd_price, image, quantity)
+                )
+
+            conn.commit()
+            toast(f"تم إضافة {quantity} من '{name}' إلى السلة بنجاح!", color="success")
+
     view_cart()
 
+
 def view_cart():
+    """Displays items stored in user's cart."""
     clear()
-    render_header("سلة التسوق الخاصة بك")
-    
+    render_header("سلة التسوق")
+
     if not current_user:
         toast("يرجى تسجيل الدخول لعرض سلة التسوق.", color="warning")
-        login_page()
+        auth_menu()
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, quantity, image FROM cart WHERE user_id = ?", (current_user['id'],))
-    items = cursor.fetchall()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, quantity, image FROM cart WHERE user_id = ?", (current_user["id"],))
+        items = cursor.fetchall()
 
     curr_info = CURRENCIES[selected_currency]
 
@@ -167,7 +380,7 @@ def view_cart():
             total = converted_price * quantity
             grand_total += total
             img_src = get_image_source(img_path)
-            
+
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
             table_data.append([
                 put_html(img_html),
@@ -178,7 +391,7 @@ def view_cart():
             ])
 
         put_table(table_data)
-        
+
         put_html(f"""
             <div style="background: #ffffff; padding: 20px; border-radius: 12px; margin: 20px auto; max-width: 400px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); text-align: center; font-weight: 900;">
                 <h3 style="margin: 0; color: #1a202c; font-weight: 900; font-size: 22px;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:.2f} {curr_info['symbol']}</span></h3>
@@ -186,38 +399,44 @@ def view_cart():
         """)
 
     act = actions("الخيارات المتاحة:", [
-        {'label': '📄 تحميل الفاتورة (PDF)', 'value': 'pdf', 'color': 'success'},
-        {'label': '🗑️ تفريغ السلة', 'value': 'clear_cart', 'color': 'danger'},
-        {'label': '🛍️ مواصلة التسوق', 'value': 'shop', 'color': 'primary'},
-        {'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
+        {"label": "📄 تحميل الفاتورة (PDF)", "value": "pdf", "color": "success"},
+        {"label": "🗑️ تفريغ السلة", "value": "clear_cart", "color": "danger"},
+        {"label": "🛍️ مواصلة التسوق", "value": "shop", "color": "primary"},
+        {"label": "🔙 القائمة الرئيسية", "value": "home", "color": "secondary"}
     ])
 
-    if act == 'pdf': generate_pdf_invoice(); return
-    elif act == 'clear_cart': empty_user_cart(); return
-    elif act == 'shop': user_shop(); return
-    elif act == 'home': main_menu(); return
+    if act == "pdf":
+        generate_pdf_invoice()
+    elif act == "clear_cart":
+        empty_user_cart()
+    elif act == "shop":
+        user_shop()
+    elif act == "home":
+        main_menu()
 
     render_footer()
 
+
 def empty_user_cart():
+    """Clears active user cart."""
     if current_user:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM cart WHERE user_id = ?", (current_user["id"],))
+            conn.commit()
         toast("تم تفريغ سلة التسوق بنجاح.", color="info")
     view_cart()
 
+
 def generate_pdf_invoice():
+    """Generates PDF invoice download via ReportLab."""
     if not current_user:
         return
-        
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, price, quantity FROM cart WHERE user_id = ?", (current_user['id'],))
-    items = cursor.fetchall()
-    conn.close()
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, price, quantity FROM cart WHERE user_id = ?", (current_user["id"],))
+        items = cursor.fetchall()
 
     if not items:
         toast("السلة فارغة، لا يمكن إنتاج فاتورة!", color="warning")
@@ -238,7 +457,7 @@ def generate_pdf_invoice():
         alignment=1,
         textColor=colors.HexColor("#1a202c")
     )
-    
+
     normal_style = ParagraphStyle(
         'NormalStyle',
         parent=styles['Normal'],
@@ -253,7 +472,7 @@ def generate_pdf_invoice():
     story.append(Paragraph("OFFICIAL INVOICE / RECEIPT", normal_style))
     story.append(Spacer(1, 15))
 
-    customer_info = f"Customer: {current_user['name']} | Currency: {selected_currency}"
+    customer_info = f"Customer: {current_user['name']} | Email: {current_user['email']}"
     story.append(Paragraph(customer_info, normal_style))
     story.append(Spacer(1, 15))
 
@@ -293,57 +512,70 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", pdf_data)
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Administration Views ---
 
+# --- Administration Views ---
 def admin_dashboard():
+    """Admin management portal."""
+    if not current_user or current_user["is_admin"] != 1:
+        toast("غير مصرح لك بدخول هذه الصفحة!", color="error")
+        main_menu()
+        return
+
     clear()
     render_header("لوحة التحكم وإدارة العطور")
-    
+
     put_html("<h2 style='color: #1a202c; text-align: center; font-weight: 900; font-size: 24px;'>⚙️ لوحة إدارة المتجر</h2>")
-    
+
     choice = actions("اختر العملية المطلوبة:", [
         {'label': '➕ إضافة عطر جديد', 'value': 'add', 'color': 'success'},
         {'label': '📋 عرض وتعديل قائمة العطور', 'value': 'list', 'color': 'primary'},
         {'label': '🔙 العودة للقائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
     ])
-    
-    if choice == 'add': add_product_page(); return
-    elif choice == 'list': list_products_page(); return
-    elif choice == 'home': main_menu(); return
+
+    if choice == 'add':
+        add_product_page()
+    elif choice == 'list':
+        list_products_page()
+    elif choice == 'home':
+        main_menu()
+
 
 def add_product_page():
+    """Adds a new perfume product to database."""
     clear()
-    render_header("إضافة عطر جديد إلى المتجر")
-    
+    render_header("إضافة عطر جديد")
+
     data = input_group("إضافة عطر جديد", [
         input("اسم العطر", name="name", required=True),
         input("السعر", name="price", type=NUMBER, required=True),
         select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="EUR (€)"),
         file_upload("صورة العطر", name="image", accept="image/*", required=True)
     ])
-    
+
     image_str = process_and_save_image(data['image'])
-        
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
-                   (data['name'], float(data['price']), data['currency'], image_str))
-    conn.commit()
-    conn.close()
-    
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
+            (data['name'], float(data['price']), data['currency'], image_str)
+        )
+        conn.commit()
+
     toast("تمت إضافة العطر بنجاح!", color="success")
     admin_dashboard()
 
+
 def list_products_page():
+    """Lists registered products with edit and delete buttons."""
     clear()
     render_header("إدارة وتعديل العطور المسجلة")
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products")
-    products = cursor.fetchall()
-    conn.close()
-    
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products")
+        products = cursor.fetchall()
+
     curr_info = CURRENCIES[selected_currency]
 
     if not products:
@@ -352,12 +584,12 @@ def list_products_page():
         table_data = [["المعرف", "الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
         for prod in products:
             p_id, name, base_price, item_currency, img_path = prod
-            
+
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
-            
+
             img_html = f'<img src="{img_src}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px;">'
-            
+
             table_data.append([
                 str(p_id),
                 put_html(img_html),
@@ -368,7 +600,7 @@ def list_products_page():
                     {'label': '🗑️ حذف', 'value': 'del', 'color': 'danger'}
                 ], onclick=lambda btn, item_id=p_id: handle_product_action(btn, item_id))
             ])
-            
+
         put_table(table_data)
 
     act = actions("", [
@@ -380,28 +612,30 @@ def list_products_page():
 
     render_footer()
 
+
 def handle_product_action(action, p_id):
+    """Processes deletion or edit execution for selected products."""
     if action == 'del':
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
+            conn.commit()
         toast("تم حذف العطر بنجاح.", color="info")
         list_products_page()
     elif action == 'edit':
         edit_product_page(p_id)
 
+
 def edit_product_page(product_id):
+    """Edits specific perfume data."""
     clear()
     render_header("تعديل بيانات العطر")
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
-    product = cursor.fetchone()
-    conn.close()
-    
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
+        product = cursor.fetchone()
+
     if not product:
         toast("العطر غير موجود!", color="error")
         list_products_page()
@@ -415,34 +649,34 @@ def edit_product_page(product_id):
         select("عملة السعر المسجلة", list(CURRENCIES.keys()), name="currency", value=p_currency),
         file_upload("تحديث صورة العطر (اختياري)", name="image", accept="image/*")
     ])
-    
+
     image_str = p_image
     if data['image'] and data['image'].get('content'):
         image_str = process_and_save_image(data['image'])
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
-                   (data['name'], float(data['price']), data['currency'], image_str, product_id))
-    conn.commit()
-    conn.close()
-    
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
+            (data['name'], float(data['price']), data['currency'], image_str, product_id)
+        )
+        conn.commit()
+
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- WSGI Application Binding for Flask / Server Deployments ---
 
-app = Flask(__name__)
+# --- Application Binding & Startup ---
+app.add_url_rule("/", "webio_view", webio_view(auth_menu), methods=["GET", "POST", "OPTIONS"])
 
-# Route PyWebIO views into Flask endpoints
-app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
 
 def open_browser():
-    """Opens default web browser for local execution."""
+    """Opens browser local session."""
     time.sleep(1.5)
     webbrowser.open(f"http://localhost:{PORT}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
+    init_db()
     threading.Thread(target=open_browser, daemon=True).start()
-    # Runs the PyWebIO standalone server locally or via Flask webview
-    start_server(main_menu, port=PORT, debug=True)
+    app.run(host="0.0.0.0", port=PORT, debug=True)
