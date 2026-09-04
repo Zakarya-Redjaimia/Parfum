@@ -10,3 +10,4 @@ user-agents
 gunicorn
 flask
 werkzeug
+gevent
