@@ -29,7 +29,7 @@ PORT = int(os.environ.get("PORT", 8080))
 STORE_BRAND = "Luxury Impact Parfum RZ"
 STORE_PHONE = "0542932846"
 STORE_EMAIL = "contact@luxuryimpactparfum.com"
-STORE_WEBSITE = "https://www.luxuryimpactparfum.com"
+STORE_WEBSITE = "https://rzparfum.onrender.com/"
 DB_EXPORT_SECRET = os.environ.get("DB_EXPORT_SECRET", "super-secret-passphrase-rz")
 
 DATA_DIR = Path(os.environ.get("RENDER_DISK_PATH", "."))
