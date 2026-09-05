@@ -106,7 +106,7 @@ def generate_product_qr_svg(product_name):
         f"Ingredients Link: {search_url}"
     )
     
-    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=4, border=1)
     qr.add_data(qr_payload)
     qr.make(fit=True)
     
@@ -184,18 +184,42 @@ def convert_price(amount, from_curr, to_curr):
 def render_header(subtitle=""):
     put_html(f"""
         <style>
-            /* Global Table Styling to Fit QR Codes Comfortably */
+            /* Force table to respect exact container bounds and fixed layouts */
+            .pywebio-table-container {{
+                overflow-x: auto !important;
+                width: 100% !important;
+            }}
             table {{
                 width: 100% !important;
+                table-layout: fixed !important;
                 border-collapse: collapse !important;
                 margin-top: 15px !important;
             }}
             th, td {{
-                padding: 12px 16px !important;
+                padding: 8px 10px !important;
                 vertical-align: middle !important;
                 text-align: center !important;
+                word-wrap: break-word !important;
+                overflow: hidden !important;
             }}
             
+            /* Constrain SVG elements tightly within table cells */
+            .qr-container {{
+                width: 75px !important;
+                height: 75px !important;
+                margin: 0 auto !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+            }}
+            .qr-container svg {{
+                width: 100% !important;
+                height: 100% !important;
+                max-width: 100% !important;
+                max-height: 100% !important;
+                display: block !important;
+            }}
+
             /* Custom Interactive Ingredient Link Styling */
             .ingredient-link {{
                 color: #3182ce;
@@ -207,10 +231,10 @@ def render_header(subtitle=""):
                 color: #2b6cb0;
             }}
             .ingredient-link:active {{
-                color: #e53e3e; /* Highlights Red on click/press */
+                color: #e53e3e; /* Red highlight on click */
             }}
             .ingredient-link:visited {{
-                color: #805ad5; /* Purple after being visited */
+                color: #805ad5; /* Purple after visited */
             }}
         </style>
         <div style="background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); color: white; padding: 20px; border-radius: 12px; margin-bottom: 25px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
@@ -347,16 +371,16 @@ def user_shop():
             
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
-            img_html = f'<img src="{img_src}" style="width: 80px; height: 80px; object-fit: cover; border-radius: 8px;">'
+            img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
 
             qr_svg = generate_product_qr_svg(name)
-            qr_html = f'<div style="width: 100px; height: 100px; margin: auto;">{qr_svg}</div>'
+            qr_html = f'<div class="qr-container">{qr_svg}</div>'
 
             search_url = get_ingredient_search_url(name)
 
             details_html = f"""
-                <div style="text-align: right; line-height: 1.6;">
-                    <b style="font-size: 16px;">{name}</b><br/>
+                <div style="text-align: right; line-height: 1.5;">
+                    <b style="font-size: 15px;">{name}</b><br/>
                     <small style="color: #718096;"><b>الهاتف:</b> {STORE_PHONE}</small><br/>
                     <a href="{search_url}" target="_blank" class="ingredient-link">المكونات</a>
                 </div>
@@ -370,7 +394,8 @@ def user_shop():
                 put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}], onclick=lambda val: add_to_cart(val))
             ])
         
-        put_table(table_data)
+        # Enforce column widths so QR code doesn't overlap adjacent columns
+        put_table(table_data, colWidths=['12%', '33%', '18%', '17%', '20%'])
 
     act = actions("", [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}])
     if act == 'home': main_menu()
