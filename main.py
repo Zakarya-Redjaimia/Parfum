@@ -12,7 +12,7 @@ import qrcode.image.svg
 
 from flask import Flask, send_from_directory, jsonify
 from pywebio.platform.flask import webio_view
-from pywebio.session import local as session_local
+from pywebio.session import local as session_local, eval_js, run_js
 from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
 from pywebio.output import (
     clear, put_html, put_table, put_buttons, toast, download
@@ -146,13 +146,41 @@ def admin_exists():
         cursor.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
         return cursor.fetchone() is not None
 
-# --- Session Helpers & Security Decorators ---
+# --- Session Helpers & Browser LocalStorage Persistence ---
 
 def get_current_user():
     return getattr(session_local, 'user', None)
 
 def set_current_user(user_dict):
     session_local.user = user_dict
+    if user_dict:
+        # Save session to browser LocalStorage to persist on refresh
+        run_js(f"localStorage.setItem('user_session_id', '{user_dict['id']}');")
+    else:
+        # Remove session from browser LocalStorage on logout
+        run_js("localStorage.removeItem('user_session_id');")
+
+def restore_session_from_browser():
+    """Restores user session from browser LocalStorage if PyWebIO session was cleared on refresh."""
+    if get_current_user():
+        return
+    try:
+        user_id = eval_js("localStorage.getItem('user_session_id')")
+        if user_id:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, name, username, email, role FROM users WHERE id = ?", (user_id,))
+                user = cursor.fetchone()
+                if user:
+                    session_local.user = {
+                        'id': user['id'],
+                        'name': user['name'],
+                        'username': user['username'],
+                        'email': user['email'],
+                        'role': user['role']
+                    }
+    except Exception:
+        pass
 
 def get_selected_currency():
     return getattr(session_local, 'currency', "DA (د.ج)")
@@ -163,8 +191,9 @@ def set_selected_currency(currency_code):
 def require_auth(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        restore_session_from_browser()
         if not get_current_user():
-            toast("عذراً! يجب تسجيل الدخول بالاسم وكلمة المرور الصحيحة أولاً.", color="warning")
+            toast("عذراً! يجب تسجيل الدخول أولاً.", color="warning")
             login_page()
             return
         return func(*args, **kwargs)
@@ -173,6 +202,7 @@ def require_auth(func):
 def require_admin(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        restore_session_from_browser()
         user = get_current_user()
         if not user or user.get('role') != 'admin':
             toast("غير مصرح لك بالوصول إلى هذه الصفحة. صلاحيات مدير النظام مطلوبة.", color="error")
@@ -190,6 +220,9 @@ def convert_price(amount, from_curr, to_curr):
     return eur_amount * CURRENCIES[to_curr]["rate"]
 
 def render_header(subtitle=""):
+    # Reset footer render tracker on page redraw
+    session_local.footer_rendered = False
+    
     put_html(f"""
         <style>
             .ingredient-link {{
@@ -209,7 +242,11 @@ def render_header(subtitle=""):
     """)
 
 def render_footer():
-    """Renders the website link footer strictly once at the bottom."""
+    """Renders the website link footer strictly ONCE per view."""
+    if getattr(session_local, 'footer_rendered', False):
+        return
+        
+    session_local.footer_rendered = True
     put_html(f"""
         <div style="margin-top: 40px; padding: 15px; text-align: center; border-top: 1px solid #e2e8f0; font-size: 14px; color: #4a5568;">
             🌐 زيارة موقعنا الرسمي: <a href="{STORE_WEBSITE}" target="_blank" style="color: #3182ce; font-weight: bold; text-decoration: none;">{STORE_WEBSITE}</a>
@@ -220,6 +257,7 @@ def render_footer():
 
 def main_menu():
     clear()
+    restore_session_from_browser()
     render_header("المتجر الإلكتروني الرسمي للعطور الفاخرة")
 
     current_user = get_current_user()
@@ -239,6 +277,8 @@ def main_menu():
         options.append({'label': '🔑 تسجيل الدخول', 'value': 'login', 'color': 'info'})
         options.append({'label': '📝 إنشاء حساب جديد', 'value': 'register', 'color': 'secondary'})
 
+    render_footer()
+
     choice = actions("القائمة الرئيسية:", options)
 
     if choice == 'shop':
@@ -253,7 +293,7 @@ def main_menu():
         register_page()
     elif choice == 'logout':
         set_current_user(None)
-        toast("تم تسجيل الخروج وتأمين الجلسة بنجاح.", color="info")
+        toast("تم تسجيل الخروج بنجاح.", color="info")
         main_menu()
 
 # --- Auth System ---
@@ -276,7 +316,7 @@ def register_page():
 
     selected_role = data['role']
     if selected_role == 'admin' and admin_exists():
-        toast("خطأ: يوجد مدير نظام مسجل بالفعل! تم تحويل حسابك إلى مستخدم عادي.", color="warning")
+        toast("خطأ: يوجد مدير نظام مسجل بالفعل!", color="warning")
         selected_role = 'user'
 
     hashed_pw = generate_password_hash(data['password'].strip())
@@ -325,7 +365,7 @@ def login_page():
         }
         set_current_user(user_dict)
         
-        currency_choice = select("اختر عملة التسوق المفضلة لهذا المعرض:", list(CURRENCIES.keys()), value="DA (د.ج)")
+        currency_choice = select("اختر عملة التسوق المفضلة:", list(CURRENCIES.keys()), value="DA (د.ج)")
         set_selected_currency(currency_choice)
         
         toast(f"مرحباً بك {user['name']}!", color="success")
@@ -338,6 +378,7 @@ def login_page():
 
 def user_shop():
     clear()
+    restore_session_from_browser()
     render_header("تصفح قائمة العطور المعروضة في المتجر")
 
     selected_currency = get_selected_currency()
@@ -351,7 +392,6 @@ def user_shop():
     if not products:
         put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
     else:
-        # Container with Flexbox layout to align product cards horizontally side-by-side
         cards_html = """
         <div style="
             display: flex; 
@@ -577,6 +617,8 @@ def admin_dashboard():
     clear()
     render_header("لوحة التحكم وإدارة العطور")
 
+    render_footer()
+
     choice = actions("اختر العملية المطلوبة:", [
         {'label': '➕ إضافة عطر جديد', 'value': 'add', 'color': 'success'},
         {'label': '📋 عرض وتعديل قائمة العطور', 'value': 'list', 'color': 'primary'},
@@ -586,8 +628,6 @@ def admin_dashboard():
     if choice == 'add': add_product_page()
     elif choice == 'list': list_products_page()
     elif choice == 'home': main_menu()
-
-    render_footer()
 
 @require_admin
 def add_product_page():
