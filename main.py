@@ -2,6 +2,7 @@ import sqlite3
 import time
 import os
 import functools
+import urllib.parse
 from pathlib import Path
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -97,16 +98,14 @@ init_db()
 
 # --- Utility Functions ---
 
-def generate_product_qr_svg(product_name, ingredients, phone):
-    phone_number = phone.strip() if phone else STORE_PHONE
-    ing_text = ingredients.strip() if ingredients else "Standard Perfume Formulation"
-    
-    qr_payload = (
-        f"Brand: {STORE_BRAND}\n"
-        f"Product: {product_name}\n"
-        f"Ingredients: {ing_text}\n"
-        f"Contact/Order Phone: {phone_number}"
-    )
+def generate_product_qr_svg(product_name, ingredients=None, phone=None):
+    """
+    Generates an SVG QR code encoding ONLY a dynamic Google search URL 
+    linking directly to the product's perfume ingredients/notes online.
+    """
+    search_query = f"{product_name} perfume ingredients notes"
+    encoded_query = urllib.parse.quote_plus(search_query)
+    qr_payload = f"https://www.google.com/search?q={encoded_query}"
     
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
     qr.add_data(qr_payload)
@@ -308,7 +307,7 @@ def user_shop():
             disp_price = convert_price(base_price, item_currency, selected_currency)
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
 
-            qr_svg = generate_product_qr_svg(name, ingredients, phone)
+            qr_svg = generate_product_qr_svg(name)
             qr_html = f'<div style="width: 80px; height: 80px;">{qr_svg}</div>'
 
             details_html = f"""
