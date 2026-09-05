@@ -51,15 +51,18 @@ def get_db_connection():
 
 def init_db():
     with get_db_connection() as conn:
+        # Schema updated to store username, email, hashed password, name, and role
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
                 name TEXT NOT NULL,
                 role TEXT DEFAULT 'user'
             )
         """)
+        # Schema for storing perfume products and prices
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +72,7 @@ def init_db():
                 image TEXT
             )
         """)
+        # Schema for shopping cart data
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cart (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -208,7 +212,7 @@ def render_header(subtitle=""):
     """)
 
 def render_footer():
-    """Renders the website link footer strictly once at the absolute bottom."""
+    """Renders the website link footer strictly once at the bottom."""
     put_html(f"""
         <div style="margin-top: 40px; padding: 15px; text-align: center; border-top: 1px solid #e2e8f0; font-size: 14px; color: #4a5568;">
             🌐 زيارة موقعنا الرسمي: <a href="{STORE_WEBSITE}" target="_blank" style="color: #3182ce; font-weight: bold; text-decoration: none;">{STORE_WEBSITE}</a>
@@ -225,7 +229,7 @@ def main_menu():
     current_currency = get_selected_currency()
 
     if current_user:
-        put_html(f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>العملة الحالية:</b> {current_currency}</div>")
+        put_html(f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>البريد:</b> {current_user['email']} | <b>العملة الحالية:</b> {current_currency}</div>")
 
     options = [{'label': '🛍️ تصفح المتجر', 'value': 'shop', 'color': 'primary'}]
 
@@ -268,6 +272,7 @@ def register_page():
     data = input_group("تسجيل حساب جديد", [
         input("الاسم الكامل", name="name", required=True),
         input("اسم المستخدم", name="username", required=True),
+        input("البريد الإلكتروني", name="email", type=TEXT, required=True),
         input("كلمة المرور", name="password", type=TEXT, required=True),
         select("نوع الحساب", role_options, name="role")
     ])
@@ -283,14 +288,18 @@ def register_page():
         cursor = conn.cursor()
         try:
             cursor.execute(
-                "INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)",
-                (data['name'].strip(), data['username'].strip(), hashed_pw, selected_role)
+                "INSERT INTO users (name, username, email, password, role) VALUES (?, ?, ?, ?, ?)",
+                (data['name'].strip(), data['username'].strip(), data['email'].strip().lower(), hashed_pw, selected_role)
             )
             conn.commit()
             toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
             login_page()
-        except sqlite3.IntegrityError:
-            toast("اسم المستخدم هذا مستخدم بالفعل. يرجى اختيار اسم آخر.", color="error")
+        except sqlite3.IntegrityError as e:
+            err_msg = str(e)
+            if "users.email" in err_msg:
+                toast("البريد الإلكتروني هذا مستخدم بالفعل.", color="error")
+            else:
+                toast("اسم المستخدم هذا مستخدم بالفعل.", color="error")
             register_page()
 
 def login_page():
@@ -298,17 +307,25 @@ def login_page():
     render_header("تسجيل الدخول الآمن")
 
     data = input_group("أدخل بيانات الاعتماد", [
-        input("اسم المستخدم", name="username", required=True),
+        input("اسم المستخدم أو البريد الإلكتروني", name="login_id", required=True),
         input("كلمة المرور", name="password", type=TEXT, required=True)
     ])
 
+    login_id = data['login_id'].strip()
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, username, password, role FROM users WHERE username = ?", (data['username'].strip(),))
+        cursor.execute("SELECT id, name, username, email, password, role FROM users WHERE username = ? OR email = ?", (login_id, login_id.lower()))
         user = cursor.fetchone()
 
     if user and check_password_hash(user['password'], data['password'].strip()):
-        user_dict = {'id': user['id'], 'name': user['name'], 'username': user['username'], 'role': user['role']}
+        user_dict = {
+            'id': user['id'], 
+            'name': user['name'], 
+            'username': user['username'], 
+            'email': user['email'], 
+            'role': user['role']
+        }
         set_current_user(user_dict)
         
         currency_choice = select("اختر عملة التسوق المفضلة لهذا المعرض:", list(CURRENCIES.keys()), value="DA (د.ج)")
@@ -317,7 +334,7 @@ def login_page():
         toast(f"مرحباً بك {user['name']}!", color="success")
         main_menu()
     else:
-        toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
+        toast("خطأ: بيانات الدخول أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
 # --- Protected Store & Cart Views ---
