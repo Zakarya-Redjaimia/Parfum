@@ -10,7 +10,7 @@ from werkzeug.utils import secure_filename
 import qrcode
 import qrcode.image.svg
 
-from flask import Flask, send_from_directory, jsonify
+from flask import Flask, send_from_directory, jsonify, send_file, abort
 from pywebio.platform.flask import webio_view
 from pywebio.session import local as session_local, eval_js, run_js
 from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
@@ -30,6 +30,7 @@ STORE_BRAND = "Luxury Impact Parfum RZ"
 STORE_PHONE = "0542932846"
 STORE_EMAIL = "contact@luxuryimpactparfum.com"
 STORE_WEBSITE = "https://www.luxuryimpactparfum.com"
+DB_EXPORT_SECRET = os.environ.get("DB_EXPORT_SECRET", "super-secret-passphrase-rz")
 
 DATA_DIR = Path(os.environ.get("RENDER_DISK_PATH", "."))
 DB_NAME = DATA_DIR / "shop_db.sqlite"
@@ -90,15 +91,12 @@ init_db()
 # --- Utility Functions ---
 
 def get_ingredient_search_url(product_name):
-    """Generates the Google Search URL for perfume ingredients."""
     search_query = f"{product_name} perfume ingredients notes"
     encoded_query = urllib.parse.quote_plus(search_query)
     return f"https://www.google.com/search?q={encoded_query}"
 
 def generate_product_qr_svg(product_name):
-    """Generates an SVG QR code encoding brand, perfume, phone, email, and ingredient search URL."""
     search_url = get_ingredient_search_url(product_name)
-    
     qr_payload = (
         f"Brand: {STORE_BRAND}\n"
         f"Perfume: {product_name}\n"
@@ -106,11 +104,9 @@ def generate_product_qr_svg(product_name):
         f"Admin Email: {STORE_EMAIL}\n"
         f"Ingredients Link: {search_url}"
     )
-    
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=4, border=1)
     qr.add_data(qr_payload)
     qr.make(fit=True)
-    
     img = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage)
     stream = BytesIO()
     img.save(stream)
@@ -119,15 +115,12 @@ def generate_product_qr_svg(product_name):
 def save_uploaded_file(file_data):
     if not file_data or 'content' not in file_data:
         return ""
-    
     original_name = file_data.get('filename', 'image.jpg')
     ext = Path(original_name).suffix or '.jpg'
     filename = secure_filename(f"{int(time.time())}_{os.urandom(4).hex()}{ext}")
     file_path = UPLOAD_DIR / filename
-    
     with open(file_path, "wb") as f:
         f.write(file_data['content'])
-        
     return f"/static/uploads/{filename}"
 
 def get_image_source(img_path):
@@ -140,13 +133,12 @@ def get_image_source(img_path):
     return "https://via.placeholder.com/150?text=No+Image"
 
 def admin_exists():
-    """Checks if an admin user already exists in the database."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
         return cursor.fetchone() is not None
 
-# --- Session Helpers & Browser LocalStorage Persistence ---
+# --- Robust Session Persistence ---
 
 def get_current_user():
     return getattr(session_local, 'user', None)
@@ -154,22 +146,20 @@ def get_current_user():
 def set_current_user(user_dict):
     session_local.user = user_dict
     if user_dict:
-        # Save session to browser LocalStorage to persist on refresh
-        run_js(f"localStorage.setItem('user_session_id', '{user_dict['id']}');")
+        run_js(f"window.localStorage.setItem('user_session_id', '{user_dict['id']}');")
     else:
-        # Remove session from browser LocalStorage on logout
-        run_js("localStorage.removeItem('user_session_id');")
+        run_js("window.localStorage.removeItem('user_session_id');")
 
 def restore_session_from_browser():
-    """Restores user session from browser LocalStorage if PyWebIO session was cleared on refresh."""
+    """Synchronously fetches session data from localStorage on reload."""
     if get_current_user():
-        return
+        return True
     try:
-        user_id = eval_js("localStorage.getItem('user_session_id')")
+        user_id = eval_js("window.localStorage.getItem('user_session_id')")
         if user_id:
             with get_db_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id, name, username, email, role FROM users WHERE id = ?", (user_id,))
+                cursor.execute("SELECT id, name, username, email, role FROM users WHERE id = ?", (int(user_id),))
                 user = cursor.fetchone()
                 if user:
                     session_local.user = {
@@ -179,8 +169,10 @@ def restore_session_from_browser():
                         'email': user['email'],
                         'role': user['role']
                     }
+                    return True
     except Exception:
         pass
+    return False
 
 def get_selected_currency():
     return getattr(session_local, 'currency', "DA (د.ج)")
@@ -193,7 +185,7 @@ def require_auth(func):
     def wrapper(*args, **kwargs):
         restore_session_from_browser()
         if not get_current_user():
-            toast("عذراً! يجب تسجيل الدخول أولاً.", color="warning")
+            toast("عذراً! انتهت الجلسة أو يجب تسجيل الدخول أولاً.", color="warning")
             login_page()
             return
         return func(*args, **kwargs)
@@ -205,7 +197,7 @@ def require_admin(func):
         restore_session_from_browser()
         user = get_current_user()
         if not user or user.get('role') != 'admin':
-            toast("غير مصرح لك بالوصول إلى هذه الصفحة. صلاحيات مدير النظام مطلوبة.", color="error")
+            toast("غير مصرح لك بالوصول. صلاحيات المدير مطلوبة.", color="error")
             main_menu()
             return
         return func(*args, **kwargs)
@@ -220,9 +212,7 @@ def convert_price(amount, from_curr, to_curr):
     return eur_amount * CURRENCIES[to_curr]["rate"]
 
 def render_header(subtitle=""):
-    # Reset footer render tracker on page redraw
     session_local.footer_rendered = False
-    
     put_html(f"""
         <style>
             .ingredient-link {{
@@ -242,10 +232,8 @@ def render_header(subtitle=""):
     """)
 
 def render_footer():
-    """Renders the website link footer strictly ONCE per view."""
     if getattr(session_local, 'footer_rendered', False):
         return
-        
     session_local.footer_rendered = True
     put_html(f"""
         <div style="margin-top: 40px; padding: 15px; text-align: center; border-top: 1px solid #e2e8f0; font-size: 14px; color: #4a5568;">
@@ -253,7 +241,7 @@ def render_footer():
         </div>
     """)
 
-# --- Main Flow & Views ---
+# --- Main Entry & Views ---
 
 def main_menu():
     clear()
@@ -264,7 +252,7 @@ def main_menu():
     current_currency = get_selected_currency()
 
     if current_user:
-        put_html(f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>البريد:</b> {current_user['email']} | <b>العملة الحالية:</b> {current_currency}</div>")
+        put_html(f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>البريد:</b> {current_user['email']} | <b>العملة:</b> {current_currency}</div>")
 
     options = [{'label': '🛍️ تصفح المتجر', 'value': 'shop', 'color': 'primary'}]
 
@@ -456,6 +444,10 @@ def user_shop():
 @require_auth
 def add_to_cart(product_id):
     current_user = get_current_user()
+    if not current_user:
+        toast("يرجى تسجيل الدخول أولاً قبل الشراء.", color="error")
+        login_page()
+        return
 
     qty_data = input_group("إضافة المنتج إلى السلة", [
         input("الكمية المطلوبة:", name="qty", type=NUMBER, value=1, min=1, required=True)
@@ -485,9 +477,14 @@ def add_to_cart(product_id):
 @require_auth
 def view_cart():
     clear()
+    restore_session_from_browser()
     render_header("سلة التسوق الخاصة بك")
 
     current_user = get_current_user()
+    if not current_user:
+        login_page()
+        return
+
     selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
 
@@ -545,15 +542,19 @@ def view_cart():
 @require_auth
 def empty_user_cart():
     current_user = get_current_user()
-    with get_db_connection() as conn:
-        conn.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
-        conn.commit()
-    toast("تم تفريغ سلة التسوق بنجاح.", color="info")
+    if current_user:
+        with get_db_connection() as conn:
+            conn.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
+            conn.commit()
+        toast("تم تفريغ سلة التسوق بنجاح.", color="info")
     view_cart()
 
 @require_auth
 def generate_pdf_invoice():
     current_user = get_current_user()
+    if not current_user:
+        return
+
     selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
 
@@ -610,11 +611,23 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", buffer.getvalue())
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Protected Admin Dashboard ---
+# --- Protected Admin Dashboard & DB Download ---
+
+@require_admin
+def download_database():
+    """Direct UI download trigger for shop_db.sqlite."""
+    if not DB_NAME.exists():
+        toast("خطأ: ملف قاعدة البيانات غير موجود!", color="error")
+        return
+    with open(DB_NAME, "rb") as f:
+        db_bytes = f.read()
+    download("shop_db_backup.sqlite", db_bytes)
+    toast("تم تحميل نسخة من قاعدة البيانات بنجاح!", color="success")
 
 @require_admin
 def admin_dashboard():
     clear()
+    restore_session_from_browser()
     render_header("لوحة التحكم وإدارة العطور")
 
     render_footer()
@@ -622,11 +635,15 @@ def admin_dashboard():
     choice = actions("اختر العملية المطلوبة:", [
         {'label': '➕ إضافة عطر جديد', 'value': 'add', 'color': 'success'},
         {'label': '📋 عرض وتعديل قائمة العطور', 'value': 'list', 'color': 'primary'},
+        {'label': '💾 تحميل نسخة من قاعدة البيانات (DB)', 'value': 'download_db', 'color': 'info'},
         {'label': '🔙 العودة للقائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
     ])
 
     if choice == 'add': add_product_page()
     elif choice == 'list': list_products_page()
+    elif choice == 'download_db': 
+        download_database()
+        admin_dashboard()
     elif choice == 'home': main_menu()
 
 @require_admin
@@ -743,10 +760,16 @@ def edit_product_page(product_id):
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- WSGI App Definition & Health Route ---
+# --- Application Entry Point ---
+
+def app_main():
+    restore_session_from_browser()
+    main_menu()
+
+# --- WSGI App & Export Endpoint ---
 
 app = Flask(__name__)
-app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
+app.add_url_rule('/', 'webio_view', webio_view(app_main), methods=['GET', 'POST', 'OPTIONS'])
 
 @app.route('/healthz', methods=['GET'])
 def health_check():
@@ -755,6 +778,20 @@ def health_check():
 @app.route('/static/uploads/<filename>')
 def serve_upload(filename):
     return send_from_directory(UPLOAD_DIR, filename)
+
+@app.route('/admin/export-db/<secret_key>', methods=['GET'])
+def export_database(secret_key):
+    """URL route allowing direct backup download via HTTP with a secret key."""
+    if secret_key != DB_EXPORT_SECRET:
+        abort(403)
+    if DB_NAME.exists():
+        return send_file(
+            DB_NAME,
+            as_attachment=True,
+            download_name="shop_db.sqlite",
+            mimetype="application/x-sqlite3"
+        )
+    return jsonify({"error": "Database file not found"}), 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT)
