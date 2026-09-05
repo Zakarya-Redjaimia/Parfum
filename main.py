@@ -1,18 +1,18 @@
 import sqlite3
 import time
 import os
-import io
 import functools
-import base64
-from io import BytesIO
-import threading
-import webbrowser
+from pathlib import Path
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
-from flask import Flask
+import qrcode
+import qrcode.image.svg
+
+from flask import Flask, send_from_directory, jsonify
 from pywebio.platform.flask import webio_view
-from pywebio import start_server
 from pywebio.session import local as session_local
-from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
+from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, textarea, actions
 from pywebio.output import (
     clear, put_html, put_table, put_buttons, toast, download
 )
@@ -20,12 +20,19 @@ from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from io import BytesIO
 
-# --- Configuration & Constants ---
+# --- Environment & Configuration ---
 
-DB_NAME = 'shop_db.sqlite'
-PORT = 8080
+PORT = int(os.environ.get("PORT", 8080))
 STORE_BRAND = "Luxury Impact Parfum RZ"
+STORE_PHONE = "+213 550 00 00 00"
+
+# Render Persistent Disk support or local fallback
+DATA_DIR = Path(os.environ.get("RENDER_DISK_PATH", "."))
+DB_NAME = DATA_DIR / "shop_db.sqlite"
+UPLOAD_DIR = DATA_DIR / "static" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 CURRENCIES = {
     "DA (د.ج)": {"rate": 220.0, "symbol": "DA"},
@@ -33,16 +40,14 @@ CURRENCIES = {
     "USD ($)": {"rate": 1.08, "symbol": "$"}
 }
 
-# --- Database Security Initialization ---
+# --- Database Initialization ---
 
 def get_db_connection():
-    """Returns a thread-safe connection to the SQLite database."""
     conn = sqlite3.connect(DB_NAME, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Ensures database schema exists before handling any web sessions."""
     with get_db_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -59,9 +64,20 @@ def init_db():
                 name TEXT NOT NULL,
                 price REAL NOT NULL,
                 currency TEXT NOT NULL,
-                image TEXT
+                image TEXT,
+                ingredients TEXT,
+                phone TEXT
             )
         """)
+        
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(products)")
+        columns = [column[1] for column in cursor.fetchall()]
+        if 'ingredients' not in columns:
+            cursor.execute("ALTER TABLE products ADD COLUMN ingredients TEXT")
+        if 'phone' not in columns:
+            cursor.execute("ALTER TABLE products ADD COLUMN phone TEXT")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cart (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,26 +95,66 @@ def init_db():
 
 init_db()
 
+# --- Utility Functions ---
+
+def generate_product_qr_svg(product_name, ingredients, phone):
+    phone_number = phone.strip() if phone else STORE_PHONE
+    ing_text = ingredients.strip() if ingredients else "Standard Perfume Formulation"
+    
+    qr_payload = (
+        f"Brand: {STORE_BRAND}\n"
+        f"Product: {product_name}\n"
+        f"Ingredients: {ing_text}\n"
+        f"Contact/Order Phone: {phone_number}"
+    )
+    
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
+    qr.add_data(qr_payload)
+    qr.make(fit=True)
+    
+    img = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage)
+    stream = BytesIO()
+    img.save(stream)
+    return stream.getvalue().decode('utf-8')
+
+def save_uploaded_file(file_data):
+    if not file_data or 'content' not in file_data:
+        return ""
+    
+    original_name = file_data.get('filename', 'image.jpg')
+    ext = Path(original_name).suffix or '.jpg'
+    filename = secure_filename(f"{int(time.time())}_{os.urandom(4).hex()}{ext}")
+    file_path = UPLOAD_DIR / filename
+    
+    with open(file_path, "wb") as f:
+        f.write(file_data['content'])
+        
+    return f"/static/uploads/{filename}"
+
+def get_image_source(img_path):
+    if img_path and str(img_path).startswith("/static/uploads/"):
+        filename = os.path.basename(img_path)
+        if (UPLOAD_DIR / filename).exists():
+            return img_path
+    if img_path and str(img_path).startswith("data:image"):
+        return img_path
+    return "https://via.placeholder.com/150?text=No+Image"
+
 # --- Session Helpers & Security Decorators ---
 
 def get_current_user():
-    """Retrieves session-isolated user dict."""
     return getattr(session_local, 'user', None)
 
 def set_current_user(user_dict):
-    """Sets session-isolated user dict."""
     session_local.user = user_dict
 
 def get_selected_currency():
-    """Retrieves session-isolated selected currency."""
     return getattr(session_local, 'currency', "DA (د.ج)")
 
 def set_selected_currency(currency_code):
-    """Sets session-isolated currency."""
     session_local.currency = currency_code
 
 def require_auth(func):
-    """Decorator ensuring that only authenticated users access the route."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if not get_current_user():
@@ -109,7 +165,6 @@ def require_auth(func):
     return wrapper
 
 def require_admin(func):
-    """Decorator ensuring that only users with 'admin' role access the route."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         user = get_current_user()
@@ -120,40 +175,19 @@ def require_admin(func):
         return func(*args, **kwargs)
     return wrapper
 
-# --- Conversion Helpers ---
+# --- Conversion & UI Helpers ---
 
 def convert_price(amount, from_curr, to_curr):
-    """Calculates rates accurately from EUR base rate."""
     if from_curr not in CURRENCIES or to_curr not in CURRENCIES:
         return amount
     eur_amount = amount / CURRENCIES[from_curr]["rate"]
     return eur_amount * CURRENCIES[to_curr]["rate"]
-
-def process_and_save_image(file_data):
-    if not file_data or 'content' not in file_data:
-        return ""
-    content = file_data['content']
-    mime = file_data.get('mime_type', 'image/jpeg')
-    b64_str = base64.b64encode(content).decode('utf-8')
-    return f"data:{mime};base64,{b64_str}"
-
-def get_image_source(img_path):
-    if img_path and str(img_path).startswith("data:image"):
-        return img_path
-    return "https://via.placeholder.com/150?text=No+Image"
 
 def render_header(subtitle=""):
     put_html(f"""
         <div style="background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); color: white; padding: 20px; border-radius: 12px; margin-bottom: 25px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
             <h1 style="margin: 0; font-size: 28px; font-weight: 900; letter-spacing: 1px;">✨ {STORE_BRAND} ✨</h1>
             <p style="margin: 5px 0 0 0; font-size: 14px; opacity: 0.8;">{subtitle}</p>
-        </div>
-    """)
-
-def render_footer():
-    put_html("""
-        <div style="margin-top: 40px; text-align: center; color: #718096; font-size: 12px; padding: 15px; border-top: 1px solid #e2e8f0;">
-            &copy; Luxury Impact Parfum RZ. All rights reserved.
         </div>
     """)
 
@@ -166,11 +200,8 @@ def main_menu():
     current_user = get_current_user()
     current_currency = get_selected_currency()
 
-    user_info_html = ""
     if current_user:
-        user_info_html = f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>العملة الحالية:</b> {current_currency}</div>"
-
-    put_html(user_info_html)
+        put_html(f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>العملة الحالية:</b> {current_currency}</div>")
 
     options = [{'label': '🛍️ تصفح المتجر', 'value': 'shop', 'color': 'primary'}]
 
@@ -208,12 +239,14 @@ def register_page():
         select("نوع الحساب", [("مستخدم عادي", "user"), ("مدير النظام", "admin")], name="role")
     ])
 
+    hashed_pw = generate_password_hash(data['password'].strip())
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
         try:
             cursor.execute(
                 "INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)",
-                (data['name'].strip(), data['username'].strip(), data['password'].strip(), data['role'])
+                (data['name'].strip(), data['username'].strip(), hashed_pw, data['role'])
             )
             conn.commit()
             toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
@@ -233,21 +266,17 @@ def login_page():
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, name, username, role FROM users WHERE username = ? AND password = ?", 
-            (data['username'].strip(), data['password'].strip())
-        )
+        cursor.execute("SELECT id, name, username, password, role FROM users WHERE username = ?", (data['username'].strip(),))
         user = cursor.fetchone()
 
-    if user:
+    if user and check_password_hash(user['password'], data['password'].strip()):
         user_dict = {'id': user['id'], 'name': user['name'], 'username': user['username'], 'role': user['role']}
         set_current_user(user_dict)
         
-        # Immediate post-login currency selection
         currency_choice = select("اختر عملة التسوق المفضلة لهذا المعرض:", list(CURRENCIES.keys()), value="DA (د.ج)")
         set_selected_currency(currency_choice)
         
-        toast(f"مرحباً بك {user['name']}! تم توثيق دخولك واختيار العملة: {currency_choice}", color="success")
+        toast(f"مرحباً بك {user['name']}!", color="success")
         main_menu()
     else:
         toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
@@ -264,25 +293,36 @@ def user_shop():
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, price, currency, image FROM products")
+        cursor.execute("SELECT id, name, price, currency, image, ingredients, phone FROM products")
         products = cursor.fetchall()
 
     if not products:
-        put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center; max-width: 600px; font-weight: 900;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
+        put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
     else:
-        table_data = [["الصورة", "العطر", f"السعر الفردي ({curr_info['symbol']})", "الإجراء"]]
+        table_data = [["الصورة", "العطر والمعلومات", "QR Code", f"السعر ({curr_info['symbol']})", "الإجراء"]]
         for prod in products:
-            p_id, name, base_price, item_currency, img_path = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
+            p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
+            img_path, ingredients, phone = prod['image'], prod['ingredients'], prod['phone']
+            
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
 
+            qr_svg = generate_product_qr_svg(name, ingredients, phone)
+            qr_html = f'<div style="width: 80px; height: 80px;">{qr_svg}</div>'
+
+            details_html = f"""
+                <b>{name}</b><br/>
+                <small style="color: #718096;"><b>المكونات:</b> {ingredients or 'غير مسجلة'}</small><br/>
+                <small style="color: #718096;"><b>الهاتف:</b> {phone or STORE_PHONE}</small>
+            """
+
             table_data.append([
                 put_html(img_html),
-                name,
+                put_html(details_html),
+                put_html(qr_html),
                 f"{disp_price:,.2f} {curr_info['symbol']}",
-                put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}],
-                            onclick=lambda val: add_to_cart(val))
+                put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}], onclick=lambda val: add_to_cart(val))
             ])
         put_table(table_data)
 
@@ -294,7 +334,7 @@ def add_to_cart(product_id):
     current_user = get_current_user()
 
     qty_data = input_group("إضافة المنتج إلى السلة", [
-        input("الكمية المطلوبة (1, 2, 3...):", name="qty", type=NUMBER, value=1, min=1, required=True)
+        input("الكمية المطلوبة:", name="qty", type=NUMBER, value=1, min=1, required=True)
     ])
     qty = int(qty_data['qty'])
 
@@ -304,20 +344,18 @@ def add_to_cart(product_id):
         prod = cursor.fetchone()
 
         if prod:
-            p_id, name, base_price, item_curr, img = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
-
-            cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND product_id = ?", 
-                           (current_user['id'], product_id))
+            cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND product_id = ?", (current_user['id'], product_id))
             cart_item = cursor.fetchone()
 
             if cart_item:
                 cursor.execute("UPDATE cart SET quantity = quantity + ? WHERE id = ?", (qty, cart_item['id']))
             else:
-                cursor.execute("INSERT INTO cart (user_id, product_id, name, price, quantity, image) VALUES (?, ?, ?, ?, ?, ?)",
-                               (current_user['id'], product_id, name, base_price, qty, img))
-
+                cursor.execute(
+                    "INSERT INTO cart (user_id, product_id, name, price, quantity, image) VALUES (?, ?, ?, ?, ?, ?)",
+                    (current_user['id'], product_id, prod['name'], prod['price'], qty, prod['image'])
+                )
             conn.commit()
-            toast(f"تمت إضافة ({qty}) قطعة من {name} إلى السلة بنجاح!", color="success")
+            toast(f"تمت إضافة ({qty}) قطعة من {prod['name']} إلى السلة بنجاح!", color="success")
 
 @require_auth
 def view_cart():
@@ -339,38 +377,30 @@ def view_cart():
         items = cursor.fetchall()
 
     if not items:
-        put_html("""
-            <div style="background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center; max-width: 600px; font-weight: 900;">
-                <h3>🛒 سلة التسوق فارغة حالياً.</h3>
-            </div>
-        """)
+        put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center;'><h3>🛒 سلة التسوق فارغة حالياً.</h3></div>")
     else:
         table_data = [["الصورة", "العطر", "السعر الفردي", "الكمية", "الإجمالي"]]
         grand_total = 0.0
 
         for item in items:
-            name, base_price, quantity, img_path, orig_currency = item['name'], item['price'], item['quantity'], item['image'], item['currency']
-            item_currency = orig_currency if orig_currency else "EUR (€)"
-            
-            converted_unit_price = convert_price(base_price, item_currency, selected_currency)
-            total_item_price = converted_unit_price * quantity
+            item_curr = item['currency'] if item['currency'] else "EUR (€)"
+            converted_unit_price = convert_price(item['price'], item_curr, selected_currency)
+            total_item_price = converted_unit_price * item['quantity']
             grand_total += total_item_price
-            img_src = get_image_source(img_path)
 
-            img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
+            img_html = f'<img src="{get_image_source(item["image"])}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
             table_data.append([
                 put_html(img_html),
-                name,
+                item['name'],
                 f"{converted_unit_price:,.2f} {curr_info['symbol']}",
-                str(quantity),
+                str(item['quantity']),
                 f"{total_item_price:,.2f} {curr_info['symbol']}"
             ])
 
         put_table(table_data)
-
         put_html(f"""
-            <div style="background: #ffffff; padding: 20px; border-radius: 12px; margin: 20px auto; max-width: 400px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); text-align: center; font-weight: 900;">
-                <h3 style="margin: 0; color: #1a202c; font-weight: 900; font-size: 22px;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:,.2f} {curr_info['symbol']}</span></h3>
+            <div style="background: #ffffff; padding: 20px; border-radius: 12px; margin: 20px auto; max-width: 400px; text-align: center;">
+                <h3 style="margin: 0;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:,.2f} {curr_info['symbol']}</span></h3>
             </div>
         """)
 
@@ -381,19 +411,16 @@ def view_cart():
         {'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
     ])
 
-    if act == 'pdf': generate_pdf_invoice(); return
-    elif act == 'clear_cart': empty_user_cart(); return
-    elif act == 'shop': user_shop(); return
-    elif act == 'home': main_menu(); return
-
-    render_footer()
+    if act == 'pdf': generate_pdf_invoice()
+    elif act == 'clear_cart': empty_user_cart()
+    elif act == 'shop': user_shop()
+    elif act == 'home': main_menu()
 
 @require_auth
 def empty_user_cart():
     current_user = get_current_user()
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
+        conn.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
         conn.commit()
     toast("تم تفريغ سلة التسوق بنجاح.", color="info")
     view_cart()
@@ -423,35 +450,23 @@ def generate_pdf_invoice():
     story = []
     styles = getSampleStyleSheet()
 
-    title_style = ParagraphStyle(
-        'TitleStyle', parent=styles['Heading1'], fontName='Helvetica-Bold',
-        fontSize=18, alignment=1, textColor=colors.HexColor("#1a202c")
-    )
-    normal_style = ParagraphStyle(
-        'NormalStyle', parent=styles['Normal'], fontName='Helvetica-Bold',
-        fontSize=10, alignment=1, textColor=colors.HexColor("#4a5568")
-    )
+    title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=16, alignment=1)
+    normal_style = ParagraphStyle('NormalStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=10, alignment=1)
 
     story.append(Paragraph(f"<b>{STORE_BRAND}</b>", title_style))
     story.append(Spacer(1, 4))
     story.append(Paragraph("OFFICIAL INVOICE / RECEIPT", normal_style))
-    story.append(Spacer(1, 15))
-
-    customer_info = f"Customer: {current_user['name']} | Currency: {selected_currency}"
-    story.append(Paragraph(customer_info, normal_style))
-    story.append(Spacer(1, 15))
+    story.append(Spacer(1, 10))
 
     data = [["Item Description", "Price", "Qty", "Total"]]
     grand_total = 0.0
 
     for item in items:
-        name, base_price, qty, orig_curr = item['name'], item['price'], item['quantity'], item['currency']
-        item_curr = orig_curr if orig_curr else "EUR (€)"
-        
-        price = convert_price(base_price, item_curr, selected_currency)
-        total = price * qty
+        item_curr = item['currency'] if item['currency'] else "EUR (€)"
+        price = convert_price(item['price'], item_curr, selected_currency)
+        total = price * item['quantity']
         grand_total += total
-        data.append([name, f"{price:,.2f} {curr_info['symbol']}", str(qty), f"{total:,.2f} {curr_info['symbol']}"])
+        data.append([item['name'], f"{price:,.2f} {curr_info['symbol']}", str(item['quantity']), f"{total:,.2f} {curr_info['symbol']}"])
 
     data.append(["Grand Total", "", "", f"{grand_total:,.2f} {curr_info['symbol']}"])
 
@@ -460,23 +475,13 @@ def generate_pdf_invoice():
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1a202c")),
         ('TEXTCOLOR', (0,0), (-1,0), colors.white),
         ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('BOTTOMPADDING', (0,0), (-1,0), 8),
-        ('BACKGROUND', (0,1), (-1,-2), colors.HexColor("#f7fafc")),
         ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e0")),
         ('FONTNAME', (0,-1), (-1,-1), 'Helvetica-Bold'),
-        ('BACKGROUND', (0,-1), (-1,-1), colors.HexColor("#edf2f7")),
     ]))
 
     story.append(t)
-    story.append(Spacer(1, 20))
-    story.append(Paragraph("Thank you for choosing Luxury Impact Parfum RZ!", normal_style))
-
     doc.build(story)
-    pdf_data = buffer.getvalue()
-    buffer.close()
-
-    download("Invoice_Parfum_RZ.pdf", pdf_data)
+    download("Invoice_Parfum_RZ.pdf", buffer.getvalue())
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
 # --- Protected Admin Dashboard ---
@@ -486,17 +491,15 @@ def admin_dashboard():
     clear()
     render_header("لوحة التحكم وإدارة العطور")
 
-    put_html("<h2 style='color: #1a202c; text-align: center; font-weight: 900; font-size: 24px;'>⚙️ لوحة إدارة المتجر</h2>")
-
     choice = actions("اختر العملية المطلوبة:", [
         {'label': '➕ إضافة عطر جديد', 'value': 'add', 'color': 'success'},
         {'label': '📋 عرض وتعديل قائمة العطور', 'value': 'list', 'color': 'primary'},
         {'label': '🔙 العودة للقائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
     ])
 
-    if choice == 'add': add_product_page(); return
-    elif choice == 'list': list_products_page(); return
-    elif choice == 'home': main_menu(); return
+    if choice == 'add': add_product_page()
+    elif choice == 'list': list_products_page()
+    elif choice == 'home': main_menu()
 
 @require_admin
 def add_product_page():
@@ -507,15 +510,18 @@ def add_product_page():
         input("اسم العطر", name="name", required=True),
         input("السعر", name="price", type=NUMBER, required=True),
         select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="DA (د.ج)"),
+        textarea("المكونات (Ingredients)", name="ingredients", placeholder="مثل: Bergamot, Jasmine, Amber...", required=True),
+        input("رقم هاتف الطلب/التواصل", name="phone", value=STORE_PHONE, required=True),
         file_upload("صورة العطر", name="image", accept="image/*", required=True)
     ])
 
-    image_str = process_and_save_image(data['image'])
+    image_path = save_uploaded_file(data['image'])
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
-                       (data['name'].strip(), float(data['price']), data['currency'], image_str))
+        conn.execute(
+            "INSERT INTO products (name, price, currency, image, ingredients, phone) VALUES (?, ?, ?, ?, ?, ?)",
+            (data['name'].strip(), float(data['price']), data['currency'], image_path, data['ingredients'].strip(), data['phone'].strip())
+        )
         conn.commit()
 
     toast("تمت إضافة العطر بنجاح!", color="success")
@@ -531,46 +537,44 @@ def list_products_page():
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, price, currency, image FROM products")
+        cursor.execute("SELECT id, name, price, currency, image, ingredients, phone FROM products")
         products = cursor.fetchall()
 
     if not products:
-        put_html("<div style='background: white; padding: 30px; border-radius: 12px; max-width: 600px; margin: 20px auto; font-weight: 900;'><h3>لا توجد عطور متوفرة للتعديل.</h3></div>")
+        put_html("<div style='background: white; padding: 30px; margin: 20px auto; text-align: center;'><h3>لا توجد عطور متوفرة للتعديل.</h3></div>")
     else:
-        table_data = [["المعرف", "الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
+        table_data = [["المعرف", "الصورة", "اسم العطر", "المكونات", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
         for prod in products:
-            p_id, name, base_price, item_currency, img_path = prod['id'], prod['name'], prod['price'], prod['currency'], prod['image']
-
-            img_src = get_image_source(img_path)
+            p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
+            img_path, ingredients = prod['image'], prod['ingredients']
             disp_price = convert_price(base_price, item_currency, selected_currency)
 
-            img_html = f'<img src="{img_src}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px;">'
+            img_html = f'<img src="{get_image_source(img_path)}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px;">'
 
             table_data.append([
                 str(p_id),
                 put_html(img_html),
                 name,
+                ingredients or "-",
                 f"{disp_price:,.2f} {curr_info['symbol']}",
                 put_buttons([
-                    {'label': '✏️ تعديل', 'value': 'edit', 'color': 'warning'},
-                    {'label': '🗑️ حذف', 'value': 'del', 'color': 'danger'}
-                ], onclick=lambda btn, item_id=p_id: handle_product_action(btn, item_id))
+                    {'label': '✏️ تعديل', 'value': f'edit_{p_id}', 'color': 'warning'},
+                    {'label': '🗑️ حذف', 'value': f'del_{p_id}', 'color': 'danger'}
+                ], onclick=lambda btn: handle_action(btn))
             ])
 
         put_table(table_data)
 
-    act = actions("", [
-        {'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'}
-    ])
-    if act == 'admin':
-        admin_dashboard()
+    act = actions("", [{'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'}])
+    if act == 'admin': admin_dashboard()
 
-@require_admin
-def handle_product_action(action, p_id):
+def handle_action(action_value):
+    action, p_id = action_value.split('_')
+    p_id = int(p_id)
+    
     if action == 'del':
         with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM products WHERE id = ?", (p_id,))
+            conn.execute("DELETE FROM products WHERE id = ?", (p_id,))
             conn.commit()
         toast("تم حذف العطر بنجاح.", color="info")
         list_products_page()
@@ -584,7 +588,7 @@ def edit_product_page(product_id):
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
+        cursor.execute("SELECT id, name, price, currency, image, ingredients, phone FROM products WHERE id = ?", (product_id,))
         product = cursor.fetchone()
 
     if not product:
@@ -592,41 +596,42 @@ def edit_product_page(product_id):
         list_products_page()
         return
 
-    p_name, p_price, p_currency, p_image = product['name'], product['price'], product['currency'], product['image']
-
     data = input_group("تعديل العطر", [
-        input("اسم العطر", name="name", value=p_name, required=True),
-        input("السعر", name="price", type=NUMBER, value=float(p_price), required=True),
-        select("عملة السعر المسجلة", list(CURRENCIES.keys()), name="currency", value=p_currency),
+        input("اسم العطر", name="name", value=product['name'], required=True),
+        input("السعر", name="price", type=NUMBER, value=float(product['price']), required=True),
+        select("عملة السعر المسجلة", list(CURRENCIES.keys()), name="currency", value=product['currency']),
+        textarea("المكونات (Ingredients)", name="ingredients", value=product['ingredients'] or "", required=True),
+        input("رقم هاتف التواصل", name="phone", value=product['phone'] or STORE_PHONE, required=True),
         file_upload("تحديث صورة العطر (اختياري)", name="image", accept="image/*")
     ])
 
-    image_str = p_image
+    image_path = product['image']
     if data['image'] and data['image'].get('content'):
-        image_str = process_and_save_image(data['image'])
+        image_path = save_uploaded_file(data['image'])
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
-            (data['name'].strip(), float(data['price']), data['currency'], image_str, product_id)
+        conn.execute(
+            "UPDATE products SET name = ?, price = ?, currency = ?, image = ?, ingredients = ?, phone = ? WHERE id = ?",
+            (data['name'].strip(), float(data['price']), data['currency'], image_path, data['ingredients'].strip(), data['phone'].strip(), product_id)
         )
         conn.commit()
 
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- WSGI App Setup ---
+# --- WSGI & Health Endpoint Setup ---
 
 app = Flask(__name__)
 app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
 
-flask_app = app
+@app.route('/healthz', methods=['GET'])
+def health_check():
+    """Health check endpoint targeted by cron pings to prevent server sleeping."""
+    return jsonify({"status": "ok", "timestamp": time.time()}), 200
 
-def open_browser():
-    time.sleep(1.5)
-    webbrowser.open(f"http://localhost:{PORT}")
+@app.route('/static/uploads/<filename>')
+def serve_upload(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
 
 if __name__ == '__main__':
-    threading.Thread(target=open_browser, daemon=True).start()
-    app.run(host='0.0.0.0', port=PORT, debug=True)
+    app.run(host='0.0.0.0', port=PORT)
