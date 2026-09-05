@@ -138,7 +138,7 @@ def admin_exists():
         cursor.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
         return cursor.fetchone() is not None
 
-# --- Robust Session Persistence ---
+# --- Session & Route Persistence ---
 
 def get_current_user():
     return getattr(session_local, 'user', None)
@@ -149,13 +149,23 @@ def set_current_user(user_dict):
         run_js(f"window.localStorage.setItem('user_session_id', '{user_dict['id']}');")
     else:
         run_js("window.localStorage.removeItem('user_session_id');")
+        run_js("window.localStorage.removeItem('current_page');")
+
+def set_active_page(page_name):
+    """Saves the current page route in local storage so refresh keeps the user on the same page."""
+    session_local.current_page = page_name
+    run_js(f"window.localStorage.setItem('current_page', '{page_name}');")
 
 def restore_session_from_browser():
-    """Synchronously fetches session data from localStorage on reload."""
+    """Synchronously fetches session data & selected currency from localStorage on reload."""
     if get_current_user():
         return True
     try:
         user_id = eval_js("window.localStorage.getItem('user_session_id')")
+        saved_currency = eval_js("window.localStorage.getItem('user_currency')")
+        if saved_currency:
+            session_local.currency = saved_currency
+            
         if user_id:
             with get_db_connection() as conn:
                 cursor = conn.cursor()
@@ -175,10 +185,20 @@ def restore_session_from_browser():
     return False
 
 def get_selected_currency():
-    return getattr(session_local, 'currency', "DA (د.ج)")
+    if not hasattr(session_local, 'currency'):
+        try:
+            curr = eval_js("window.localStorage.getItem('user_currency')")
+            if curr in CURRENCIES:
+                session_local.currency = curr
+            else:
+                session_local.currency = "DA (د.ج)"
+        except Exception:
+            session_local.currency = "DA (د.ج)"
+    return session_local.currency
 
 def set_selected_currency(currency_code):
     session_local.currency = currency_code
+    run_js(f"window.localStorage.setItem('user_currency', '{currency_code}');")
 
 def require_auth(func):
     @functools.wraps(func)
@@ -241,18 +261,19 @@ def render_footer():
         </div>
     """)
 
-# --- Main Entry & Views ---
+# --- Views & Controllers ---
 
 def main_menu():
     clear()
     restore_session_from_browser()
+    set_active_page("menu")
     render_header("المتجر الإلكتروني الرسمي للعطور الفاخرة")
 
     current_user = get_current_user()
     current_currency = get_selected_currency()
 
     if current_user:
-        put_html(f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>البريد:</b> {current_user['email']} | <b>العملة:</b> {current_currency}</div>")
+        put_html(f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>البريد:</b> {current_user['email']} | <b>العملة المفضلة:</b> {current_currency}</div>")
 
     options = [{'label': '🛍️ تصفح المتجر', 'value': 'shop', 'color': 'primary'}]
 
@@ -288,6 +309,7 @@ def main_menu():
 
 def register_page():
     clear()
+    set_active_page("register")
     render_header("إنشاء حساب جديد")
 
     role_options = [("مستخدم عادي", "user")]
@@ -329,6 +351,7 @@ def register_page():
 
 def login_page():
     clear()
+    set_active_page("login")
     render_header("تسجيل الدخول الآمن")
 
     data = input_group("أدخل بيانات الاعتماد", [
@@ -357,20 +380,28 @@ def login_page():
         set_selected_currency(currency_choice)
         
         toast(f"مرحباً بك {user['name']}!", color="success")
-        main_menu()
+        user_shop()
     else:
         toast("خطأ: بيانات الدخول أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
-# --- Horizontal Grid Marketplace View ---
+# --- Horizontal Grid Marketplace View with Inline Currency Control ---
 
 def user_shop():
     clear()
     restore_session_from_browser()
+    set_active_page("shop")
     render_header("تصفح قائمة العطور المعروضة في المتجر")
 
     selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
+
+    # Currency selection bar directly above market products
+    put_html(f"""
+        <div style="background: #edf2f7; padding: 12px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
+            <span style="font-weight: bold; color: #2d3748; margin-left: 10px;">💱 العملة الحالية لعرض الأسعار: {selected_currency}</span>
+        </div>
+    """)
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -430,14 +461,20 @@ def user_shop():
         cards_html += "</div>"
         put_html(cards_html)
         
+        buttons_options.append({'label': '💱 تغيير عملة العرض', 'value': 'change_currency', 'color': 'info'})
         buttons_options.append({'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'})
         
         render_footer()
         
-        act = actions("اختر العطر لإضافته للسلة:", buttons_options)
+        act = actions("اختر الإجراء المطلوب:", buttons_options)
         
         if act == 'home':
             main_menu()
+        elif act == 'change_currency':
+            new_curr = select("اختر العملة المطلوبة:", list(CURRENCIES.keys()), value=selected_currency)
+            set_selected_currency(new_curr)
+            toast("تم تغيير عملة العرض بنجاح!", color="success")
+            user_shop()
         elif isinstance(act, str) and act.startswith('cart_'):
             add_to_cart(int(act.split('_')[1]))
 
@@ -478,6 +515,7 @@ def add_to_cart(product_id):
 def view_cart():
     clear()
     restore_session_from_browser()
+    set_active_page("cart")
     render_header("سلة التسوق الخاصة بك")
 
     current_user = get_current_user()
@@ -611,7 +649,7 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", buffer.getvalue())
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Protected Admin Dashboard & DB Download ---
+# --- Protected Admin Dashboard ---
 
 @require_admin
 def download_database():
@@ -628,6 +666,7 @@ def download_database():
 def admin_dashboard():
     clear()
     restore_session_from_browser()
+    set_active_page("admin")
     render_header("لوحة التحكم وإدارة العطور")
 
     render_footer()
@@ -649,6 +688,7 @@ def admin_dashboard():
 @require_admin
 def add_product_page():
     clear()
+    set_active_page("add_product")
     render_header("إضافة عطر جديد إلى المتجر")
 
     data = input_group("إضافة عطر جديد", [
@@ -673,6 +713,7 @@ def add_product_page():
 @require_admin
 def list_products_page():
     clear()
+    set_active_page("list_products")
     render_header("إدارة وتعديل العطور المسجلة")
 
     selected_currency = get_selected_currency()
@@ -727,6 +768,7 @@ def handle_action(action_value):
 @require_admin
 def edit_product_page(product_id):
     clear()
+    set_active_page("edit_product")
     render_header("تعديل بيانات العطر")
 
     with get_db_connection() as conn:
@@ -760,11 +802,29 @@ def edit_product_page(product_id):
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- Application Entry Point ---
+# --- Entry Point with Page Routing on Refresh ---
 
 def app_main():
     restore_session_from_browser()
-    main_menu()
+    
+    current_page = "menu"
+    try:
+        saved_page = eval_js("window.localStorage.getItem('current_page')")
+        if saved_page:
+            current_page = saved_page
+    except Exception:
+        pass
+
+    if current_page == "shop":
+        user_shop()
+    elif current_page == "cart":
+        view_cart()
+    elif current_page == "admin":
+        admin_dashboard()
+    elif current_page == "list_products":
+        list_products_page()
+    else:
+        main_menu()
 
 # --- WSGI App & Export Endpoint ---
 
