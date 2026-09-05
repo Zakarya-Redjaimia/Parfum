@@ -138,6 +138,13 @@ def get_image_source(img_path):
         return img_path
     return "https://via.placeholder.com/150?text=No+Image"
 
+def admin_exists():
+    """Checks if an admin user already exists in the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
+        return cursor.fetchone() is not None
+
 # --- Session Helpers & Security Decorators ---
 
 def get_current_user():
@@ -184,42 +191,6 @@ def convert_price(amount, from_curr, to_curr):
 def render_header(subtitle=""):
     put_html(f"""
         <style>
-            /* Force table to respect exact container bounds and fixed layouts */
-            .pywebio-table-container {{
-                overflow-x: auto !important;
-                width: 100% !important;
-            }}
-            table {{
-                width: 100% !important;
-                table-layout: fixed !important;
-                border-collapse: collapse !important;
-                margin-top: 15px !important;
-            }}
-            th, td {{
-                padding: 8px 10px !important;
-                vertical-align: middle !important;
-                text-align: center !important;
-                word-wrap: break-word !important;
-                overflow: hidden !important;
-            }}
-            
-            /* Constrain SVG elements tightly within table cells */
-            .qr-container {{
-                width: 75px !important;
-                height: 75px !important;
-                margin: 0 auto !important;
-                display: flex !important;
-                align-items: center !important;
-                justify-content: center !important;
-            }}
-            .qr-container svg {{
-                width: 100% !important;
-                height: 100% !important;
-                max-width: 100% !important;
-                max-height: 100% !important;
-                display: block !important;
-            }}
-
             /* Custom Interactive Ingredient Link Styling */
             .ingredient-link {{
                 color: #3182ce;
@@ -293,12 +264,23 @@ def register_page():
     clear()
     render_header("إنشاء حساب جديد")
 
+    # Only offer Admin option if no Admin account exists yet
+    role_options = [("مستخدم عادي", "user")]
+    if not admin_exists():
+        role_options.append(("مدير النظام (حساب واحد فقط متاح)", "admin"))
+
     data = input_group("تسجيل حساب جديد", [
         input("الاسم الكامل", name="name", required=True),
         input("اسم المستخدم", name="username", required=True),
         input("كلمة المرور", name="password", type=TEXT, required=True),
-        select("نوع الحساب", [("مستخدم عادي", "user"), ("مدير النظام", "admin")], name="role")
+        select("نوع الحساب", role_options, name="role")
     ])
+
+    # Double-check single admin rule on submission
+    selected_role = data['role']
+    if selected_role == 'admin' and admin_exists():
+        toast("خطأ: يوجد مدير نظام مسجل بالفعل! تم تحويل حسابك إلى مستخدم عادي.", color="warning")
+        selected_role = 'user'
 
     hashed_pw = generate_password_hash(data['password'].strip())
 
@@ -307,7 +289,7 @@ def register_page():
         try:
             cursor.execute(
                 "INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)",
-                (data['name'].strip(), data['username'].strip(), hashed_pw, data['role'])
+                (data['name'].strip(), data['username'].strip(), hashed_pw, selected_role)
             )
             conn.commit()
             toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
@@ -371,10 +353,10 @@ def user_shop():
             
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
-            img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
+            img_html = f'<img src="{img_src}" style="width: 80px; height: 80px; object-fit: cover; border-radius: 8px;">'
 
             qr_svg = generate_product_qr_svg(name)
-            qr_html = f'<div class="qr-container">{qr_svg}</div>'
+            qr_html = f'<div style="width: 80px; height: 80px; margin: auto;">{qr_svg}</div>'
 
             search_url = get_ingredient_search_url(name)
 
@@ -394,8 +376,8 @@ def user_shop():
                 put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}], onclick=lambda val: add_to_cart(val))
             ])
         
-        # Enforce column widths so QR code doesn't overlap adjacent columns
-        put_table(table_data, colWidths=['12%', '33%', '18%', '17%', '20%'])
+        # Standard PyWebIO table without unnatural width restrictions
+        put_table(table_data)
 
     act = actions("", [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}])
     if act == 'home': main_menu()
