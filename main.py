@@ -13,7 +13,7 @@ import qrcode.image.svg
 from flask import Flask, send_from_directory, jsonify, send_file, abort
 from pywebio.platform.flask import webio_view
 from pywebio.session import local as session_local, eval_js, run_js
-from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
+from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, PASSWORD, actions
 from pywebio.output import (
     clear, put_html, put_table, put_buttons, toast, download
 )
@@ -305,7 +305,7 @@ def main_menu():
         toast("تم تسجيل الخروج بنجاح.", color="info")
         main_menu()
 
-# --- Auth System ---
+# --- Auth System with Password Masking ---
 
 def register_page():
     clear()
@@ -320,7 +320,7 @@ def register_page():
         input("الاسم الكامل", name="name", required=True),
         input("اسم المستخدم", name="username", required=True),
         input("البريد الإلكتروني", name="email", type=TEXT, required=True),
-        input("كلمة المرور", name="password", type=TEXT, required=True),
+        input("كلمة المرور", name="password", type=PASSWORD, required=True),
         select("نوع الحساب", role_options, name="role")
     ])
 
@@ -356,7 +356,7 @@ def login_page():
 
     data = input_group("أدخل بيانات الاعتماد", [
         input("اسم المستخدم أو البريد الإلكتروني", name="login_id", required=True),
-        input("كلمة المرور", name="password", type=TEXT, required=True)
+        input("كلمة المرور", name="password", type=PASSWORD, required=True)
     ])
 
     login_id = data['login_id'].strip()
@@ -385,7 +385,7 @@ def login_page():
         toast("خطأ: بيانات الدخول أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
-# --- Horizontal Grid Marketplace View with Inline Currency Control ---
+# --- Horizontal Grid Marketplace View ---
 
 def user_shop():
     clear()
@@ -396,7 +396,6 @@ def user_shop():
     selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
 
-    # Currency selection bar directly above market products
     put_html(f"""
         <div style="background: #edf2f7; padding: 12px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
             <span style="font-weight: bold; color: #2d3748; margin-left: 10px;">💱 العملة الحالية لعرض الأسعار: {selected_currency}</span>
