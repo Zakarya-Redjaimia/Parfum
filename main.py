@@ -1,202 +1,813 @@
+import sqlite3
+import time
 import os
-import io
-import qrcode
+import functools
+import urllib.parse
+from pathlib import Path
+from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+import qrcode
+import qrcode.image.svg
+
+from flask import Flask, send_from_directory, jsonify, send_file, abort
+from pywebio.platform.flask import webio_view
+from pywebio.session import local as session_local, eval_js, run_js
+from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
+from pywebio.output import (
+    clear, put_html, put_table, put_buttons, toast, download
+)
+from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from io import BytesIO
 
-import pywebio
-from pywebio import start_server
-from pywebio.input import input, textarea, select, file_upload, input_group, actions
-from pywebio.output import put_text, put_markdown, put_buttons, put_file, put_html, put_table, clear, toast
+# --- Environment & Configuration ---
 
-# ----------------------------------------------------------------------
-# Application Configuration & In-Memory Store
-# ----------------------------------------------------------------------
-PERFUME_CATALOG = []
+PORT = int(os.environ.get("PORT", 8080))
+STORE_BRAND = "Luxury Impact Parfum RZ"
+STORE_PHONE = "0542932846"
+STORE_EMAIL = "contact@luxuryimpactparfum.com"
+STORE_WEBSITE = "https://www.luxuryimpactparfum.com"
+DB_EXPORT_SECRET = os.environ.get("DB_EXPORT_SECRET", "super-secret-passphrase-rz")
 
-# ----------------------------------------------------------------------
-# Helper Functions: PDF & QR Code Generation
-# ----------------------------------------------------------------------
-def generate_qr_code(data_string: str) -> io.BytesIO:
-    """Generates a QR code image as an in-memory BytesIO stream."""
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=8,
-        border=2,
+DATA_DIR = Path(os.environ.get("RENDER_DISK_PATH", "."))
+DB_NAME = DATA_DIR / "shop_db.sqlite"
+UPLOAD_DIR = DATA_DIR / "static" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+CURRENCIES = {
+    "DA (د.ج)": {"rate": 220.0, "symbol": "DA"},
+    "EUR (€)": {"rate": 1.0, "symbol": "€"},
+    "USD ($)": {"rate": 1.08, "symbol": "$"}
+}
+
+# --- Database Initialization ---
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT DEFAULT 'user'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                currency TEXT NOT NULL,
+                image TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cart (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity INTEGER NOT NULL,
+                image TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# --- Utility Functions ---
+
+def get_ingredient_search_url(product_name):
+    search_query = f"{product_name} perfume ingredients notes"
+    encoded_query = urllib.parse.quote_plus(search_query)
+    return f"https://www.google.com/search?q={encoded_query}"
+
+def generate_product_qr_svg(product_name):
+    search_url = get_ingredient_search_url(product_name)
+    qr_payload = (
+        f"Brand: {STORE_BRAND}\n"
+        f"Perfume: {product_name}\n"
+        f"Phone: {STORE_PHONE}\n"
+        f"Admin Email: {STORE_EMAIL}\n"
+        f"Ingredients Link: {search_url}"
     )
-    qr.add_data(data_string)
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=4, border=1)
+    qr.add_data(qr_payload)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
+    img = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage)
+    stream = BytesIO()
+    img.save(stream)
+    return stream.getvalue().decode('utf-8')
 
+def save_uploaded_file(file_data):
+    if not file_data or 'content' not in file_data:
+        return ""
+    original_name = file_data.get('filename', 'image.jpg')
+    ext = Path(original_name).suffix or '.jpg'
+    filename = secure_filename(f"{int(time.time())}_{os.urandom(4).hex()}{ext}")
+    file_path = UPLOAD_DIR / filename
+    with open(file_path, "wb") as f:
+        f.write(file_data['content'])
+    return f"/static/uploads/{filename}"
 
-def generate_perfume_pdf(perfume: dict) -> bytes:
-    """Generates a PDF datasheet for a perfume and returns raw bytes."""
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
-    story = []
+def get_image_source(img_path):
+    if img_path and str(img_path).startswith("/static/uploads/"):
+        filename = os.path.basename(img_path)
+        if (UPLOAD_DIR / filename).exists():
+            return img_path
+    if img_path and str(img_path).startswith("data:image"):
+        return img_path
+    return "https://via.placeholder.com/150?text=No+Image"
 
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'DocTitle',
-        parent=styles['Heading1'],
-        fontSize=22,
-        leading=26,
-        textColor=colors.HexColor("#1A365D"),
-        alignment=1,
-    )
-    header_style = ParagraphStyle(
-        'HeaderStyle',
-        parent=styles['Heading2'],
-        fontSize=14,
-        leading=18,
-        textColor=colors.HexColor("#2B6CB0"),
-    )
-    body_style = styles['Normal']
+def admin_exists():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
+        return cursor.fetchone() is not None
 
-    # Document Header
-    story.append(Paragraph("Luxury Impact Parfume Rz", title_style))
-    story.append(Spacer(1, 15))
+# --- Robust Session Persistence Fix ---
 
-    # Details Table
-    table_data = [
-        [Paragraph("<b>Perfume Name</b>", body_style), Paragraph(perfume.get('name', ''), body_style)],
-        [Paragraph("<b>Category / Gender</b>", body_style), Paragraph(perfume.get('category', ''), body_style)],
-        [Paragraph("<b>Top Notes</b>", body_style), Paragraph(perfume.get('top_notes', ''), body_style)],
-        [Paragraph("<b>Heart Notes</b>", body_style), Paragraph(perfume.get('heart_notes', ''), body_style)],
-        [Paragraph("<b>Base Notes</b>", body_style), Paragraph(perfume.get('base_notes', ''), body_style)],
-        [Paragraph("<b>Base Price</b>", body_style), Paragraph(f"${perfume.get('price', 0):.2f}", body_style)],
-    ]
+def get_current_user():
+    return getattr(session_local, 'user', None)
 
-    table = Table(table_data, colWidths=[150, 350])
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#F7FAFC")),
-        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor("#2D3748")),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ('TOPPADDING', (0, 0), (-1, -1), 8),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0")),
-    ]))
-    story.append(table)
-    story.append(Spacer(1, 20))
+def set_current_user(user_dict):
+    session_local.user = user_dict
+    if user_dict:
+        run_js(f"window.localStorage.setItem('user_session_id', '{user_dict['id']}');")
+    else:
+        run_js("window.localStorage.removeItem('user_session_id');")
 
-    # QR Code Section
-    qr_data_str = f"Brand: Luxury Impact Parfume Rz | Name: {perfume.get('name')} | Notes: {perfume.get('top_notes')}"
-    qr_buffer = generate_qr_code(qr_data_str)
-    story.append(Paragraph("Scan QR Code for Specifications:", header_style))
-    story.append(Spacer(1, 10))
-    story.append(Image(qr_buffer, width=120, height=120))
+def sync_session():
+    """Restores session from browser local storage reliably on refresh/page load."""
+    if get_current_user():
+        return True
+    try:
+        user_id = eval_js("window.localStorage.getItem('user_session_id')")
+        if user_id:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, name, username, email, role FROM users WHERE id = ?", (int(user_id),))
+                user = cursor.fetchone()
+                if user:
+                    session_local.user = {
+                        'id': user['id'],
+                        'name': user['name'],
+                        'username': user['username'],
+                        'email': user['email'],
+                        'role': user['role']
+                    }
+                    return True
+    except Exception:
+        pass
+    return False
 
-    doc.build(story)
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
-    return pdf_bytes
+def get_selected_currency():
+    return getattr(session_local, 'currency', "DA (د.ج)")
 
-# ----------------------------------------------------------------------
-# PyWebIO Interface Logic
-# ----------------------------------------------------------------------
-def add_perfume_flow():
-    clear()
-    put_markdown("### ➕ Add New Fragrance Entry")
+def set_selected_currency(currency_code):
+    session_local.currency = currency_code
+    run_js(f"window.localStorage.setItem('user_currency', '{currency_code}');")
 
-    data = input_group("Perfume Specifications", [
-        input("Perfume Name", name="name", type="text", required=True),
-        select("Category", name="category", options=["Unisex", "For Men", "For Women", "Private Blend"]),
-        input("Top Notes", name="top_notes", placeholder="e.g. Bergamot, Pink Pepper", required=True),
-        input("Heart Notes", name="heart_notes", placeholder="e.g. Rose, Jasmine, Cedar", required=True),
-        input("Base Notes", name="base_notes", placeholder="e.g. Amber, Vanilla, Oud", required=True),
-        input("Base Price ($)", name="price", type="float", value="100.0", required=True),
-    ])
+def restore_currency():
+    if not getattr(session_local, 'currency', None):
+        try:
+            curr = eval_js("window.localStorage.getItem('user_currency')")
+            if curr in CURRENCIES:
+                session_local.currency = curr
+        except Exception:
+            pass
 
-    PERFUME_CATALOG.append(data)
-    toast(f"Added {data['name']} successfully!", color="success")
-    main_menu()
+def require_auth(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        sync_session()
+        if not get_current_user():
+            toast("عذراً! انتهت الجلسة أو يجب تسجيل الدخول أولاً.", color="warning")
+            login_page()
+            return
+        return func(*args, **kwargs)
+    return wrapper
 
+def require_admin(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        sync_session()
+        user = get_current_user()
+        if not user or user.get('role') != 'admin':
+            toast("غير مصرح لك بالوصول. صلاحيات المدير مطلوبة.", color="error")
+            main_menu()
+            return
+        return func(*args, **kwargs)
+    return wrapper
 
-def list_perfumes_flow():
-    clear()
-    put_markdown("### 🧴 Fragrance Catalog & Documentation Generator")
+# --- Conversion & UI Helpers ---
 
-    if not PERFUME_CATALOG:
-        put_text("No perfumes currently in inventory.")
-        put_buttons(["Back to Main Menu"], onclick=lambda _: main_menu())
+def convert_price(amount, from_curr, to_curr):
+    if from_curr not in CURRENCIES or to_curr not in CURRENCIES:
+        return amount
+    eur_amount = amount / CURRENCIES[from_curr]["rate"]
+    return eur_amount * CURRENCIES[to_curr]["rate"]
+
+def render_header(subtitle=""):
+    session_local.footer_rendered = False
+    put_html(f"""
+        <style>
+            .ingredient-link {{
+                color: #3182ce;
+                font-weight: bold;
+                text-decoration: underline;
+                transition: color 0.2s ease-in-out;
+            }}
+            .ingredient-link:hover {{ color: #2b6cb0; }}
+            .ingredient-link:active {{ color: #e53e3e; }}
+            .ingredient-link:visited {{ color: #805ad5; }}
+        </style>
+        <div style="background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); color: white; padding: 20px; border-radius: 12px; margin-bottom: 25px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <h1 style="margin: 0; font-size: 28px; font-weight: 900; letter-spacing: 1px;">✨ {STORE_BRAND} ✨</h1>
+            <p style="margin: 5px 0 0 0; font-size: 14px; opacity: 0.8;">{subtitle}</p>
+        </div>
+    """)
+
+def render_footer():
+    if getattr(session_local, 'footer_rendered', False):
         return
+    session_local.footer_rendered = True
+    put_html(f"""
+        <div style="margin-top: 40px; padding: 15px; text-align: center; border-top: 1px solid #e2e8f0; font-size: 14px; color: #4a5568;">
+            🌐 زيارة موقعنا الرسمي: <a href="{STORE_WEBSITE}" target="_blank" style="color: #3182ce; font-weight: bold; text-decoration: none;">{STORE_WEBSITE}</a>
+        </div>
+    """)
 
-    table_rows = []
-    for idx, item in enumerate(PERFUME_CATALOG):
-        table_rows.append([
-            idx + 1,
-            item['name'],
-            item['category'],
-            item['top_notes'],
-            f"${float(item['price']):.2f}"
-        ])
-
-    put_table(
-        table_rows,
-        header=["#", "Name", "Category", "Top Notes", "Price"]
-    )
-
-    action = actions(
-        label="Select action:",
-        buttons=[
-            {"label": "Download Datasheet (PDF)", "value": "export_pdf"},
-            {"label": "Back to Main Menu", "value": "menu"}
-        ]
-    )
-
-    if action == "export_pdf":
-        perfume_idx = input("Enter item # to export PDF:", type="number", required=True)
-        target_idx = int(perfume_idx) - 1
-
-        if 0 <= target_idx < len(PERFUME_CATALOG):
-            perfume = PERFUME_CATALOG[target_idx]
-            pdf_bytes = generate_perfume_pdf(perfume)
-            clean_filename = secure_filename(f"{perfume['name']}_datasheet.pdf")
-            put_file(clean_filename, pdf_bytes, label=f"Click here to download {clean_filename}")
-        else:
-            toast("Invalid selection number.", color="error")
-        
-        put_buttons(["Return to Catalog"], onclick=lambda _: list_perfumes_flow())
-
-    elif action == "menu":
-        main_menu()
-
+# --- Main Views & Flow Control ---
 
 def main_menu():
     clear()
-    put_markdown("# Luxury Impact Parfume Rz Management")
-    put_text("Internal Catalog & Documentation System")
-    put_html("<hr>")
+    sync_session()
+    restore_currency()
+    render_header("المتجر الإلكتروني الرسمي للعطور الفاخرة")
 
-    choice = actions(
-        label="Choose an operation:",
-        buttons=[
-            {"label": "View Catalog", "value": "view"},
-            {"label": "Add New Fragrance", "value": "add"},
-        ]
-    )
+    current_user = get_current_user()
+    current_currency = get_selected_currency()
 
-    if choice == "view":
-        list_perfumes_flow()
-    elif choice == "add":
-        add_perfume_flow()
+    if current_user:
+        put_html(f"<div style='text-align: center; margin-bottom: 15px;'><b>مرحباً بك:</b> {current_user['name']} ({current_user['role']}) | <b>البريد:</b> {current_user['email']} | <b>العملة:</b> {current_currency}</div>")
 
+    options = [{'label': '🛍️ تصفح المتجر', 'value': 'shop', 'color': 'primary'}]
 
-# ----------------------------------------------------------------------
-# Application Entry Point
-# ----------------------------------------------------------------------
-# Instantiate WSGI app for Gunicorn context
-app = pywebio.platform.flask.webio_exec(main_menu)
+    if current_user:
+        options.append({'label': '🛒 سلة التسوق', 'value': 'cart', 'color': 'success'})
+        if current_user['role'] == 'admin':
+            options.append({'label': '⚙️ لوحة التحكم', 'value': 'admin', 'color': 'warning'})
+        options.append({'label': '🚪 تسجيل الخروج', 'value': 'logout', 'color': 'danger'})
+    else:
+        options.append({'label': '🔑 تسجيل الدخول', 'value': 'login', 'color': 'info'})
+        options.append({'label': '📝 إنشاء حساب جديد', 'value': 'register', 'color': 'secondary'})
 
-if __name__ == "__main__":
-    # Local debugging execution
-    port = int(os.environ.get("PORT", 8080))
-    start_server(main_menu, port=port, debug=True)
+    render_footer()
+
+    choice = actions("القائمة الرئيسية:", options)
+
+    if choice == 'shop':
+        user_shop()
+    elif choice == 'cart':
+        view_cart()
+    elif choice == 'admin':
+        admin_dashboard()
+    elif choice == 'login':
+        login_page()
+    elif choice == 'register':
+        register_page()
+    elif choice == 'logout':
+        set_current_user(None)
+        toast("تم تسجيل الخروج بنجاح.", color="info")
+        main_menu()
+
+# --- Auth System ---
+
+def register_page():
+    clear()
+    render_header("إنشاء حساب جديد")
+
+    role_options = [("مستخدم عادي", "user")]
+    if not admin_exists():
+        role_options.append(("مدير النظام (حساب واحد فقط متاح)", "admin"))
+
+    data = input_group("تسجيل حساب جديد", [
+        input("الاسم الكامل", name="name", required=True),
+        input("اسم المستخدم", name="username", required=True),
+        input("البريد الإلكتروني", name="email", type=TEXT, required=True),
+        input("كلمة المرور", name="password", type=TEXT, required=True),
+        select("نوع الحساب", role_options, name="role")
+    ])
+
+    selected_role = data['role']
+    if selected_role == 'admin' and admin_exists():
+        toast("خطأ: يوجد مدير نظام مسجل بالفعل!", color="warning")
+        selected_role = 'user'
+
+    hashed_pw = generate_password_hash(data['password'].strip())
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO users (name, username, email, password, role) VALUES (?, ?, ?, ?, ?)",
+                (data['name'].strip(), data['username'].strip(), data['email'].strip().lower(), hashed_pw, selected_role)
+            )
+            conn.commit()
+            toast("تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.", color="success")
+            login_page()
+        except sqlite3.IntegrityError as e:
+            err_msg = str(e)
+            if "users.email" in err_msg:
+                toast("البريد الإلكتروني هذا مستخدم بالفعل.", color="error")
+            else:
+                toast("اسم المستخدم هذا مستخدم بالفعل.", color="error")
+            register_page()
+
+def login_page():
+    clear()
+    render_header("تسجيل الدخول الآمن")
+
+    data = input_group("أدخل بيانات الاعتماد", [
+        input("اسم المستخدم أو البريد الإلكتروني", name="login_id", required=True),
+        input("كلمة المرور", name="password", type=TEXT, required=True)
+    ])
+
+    login_id = data['login_id'].strip()
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, username, email, password, role FROM users WHERE username = ? OR email = ?", (login_id, login_id.lower()))
+        user = cursor.fetchone()
+
+    if user and check_password_hash(user['password'], data['password'].strip()):
+        user_dict = {
+            'id': user['id'], 
+            'name': user['name'], 
+            'username': user['username'], 
+            'email': user['email'], 
+            'role': user['role']
+        }
+        set_current_user(user_dict)
+        
+        currency_choice = select("اختر عملة التسوق المفضلة:", list(CURRENCIES.keys()), value="DA (د.ج)")
+        set_selected_currency(currency_choice)
+        
+        toast(f"مرحباً بك {user['name']}!", color="success")
+        main_menu()
+    else:
+        toast("خطأ: بيانات الدخول أو كلمة المرور غير صحيحة!", color="error")
+        login_page()
+
+# --- Market View ---
+
+def user_shop():
+    clear()
+    sync_session()
+    restore_currency()
+    render_header("تصفح قائمة العطور المعروضة في المتجر")
+
+    selected_currency = get_selected_currency()
+    curr_info = CURRENCIES[selected_currency]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products")
+        products = cursor.fetchall()
+
+    if not products:
+        put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
+        buttons_options = [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}]
+    else:
+        cards_html = """
+        <div style="
+            display: flex; 
+            flex-wrap: wrap; 
+            gap: 20px; 
+            justify-content: center; 
+            padding: 10px; 
+            direction: rtl;
+        ">
+        """
+
+        buttons_options = []
+
+        for prod in products:
+            p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
+            img_src = get_image_source(prod['image'])
+            disp_price = convert_price(base_price, item_currency, selected_currency)
+            search_url = get_ingredient_search_url(name)
+            qr_svg = generate_product_qr_svg(name)
+
+            cards_html += f"""
+            <div style="
+                background: #ffffff; 
+                border: 1px solid #e2e8f0; 
+                border-radius: 12px; 
+                width: 260px; 
+                box-shadow: 0 4px 10px rgba(0,0,0,0.05); 
+                padding: 15px; 
+                text-align: center; 
+                display: flex; 
+                flex-direction: column; 
+                justify-content: space-between;
+            ">
+                <div>
+                    <img src="{img_src}" style="width: 100%; height: 180px; object-fit: cover; border-radius: 8px; margin-bottom: 10px;">
+                    <h3 style="margin: 8px 0; font-size: 18px; color: #1a202c;">{name}</h3>
+                    <p style="color: #2b6cb0; font-weight: bold; font-size: 16px; margin: 5px 0;">
+                        {disp_price:,.2f} {curr_info['symbol']}
+                    </p>
+                    <small style="color: #718096; display: block; margin-bottom: 5px;"><b>الهاتف:</b> {STORE_PHONE}</small>
+                    <a href="{search_url}" target="_blank" class="ingredient-link" style="display: inline-block; margin: 5px 0;">🔍 المكونات</a>
+                    <div style="width: 75px; height: 75px; margin: 10px auto;">{qr_svg}</div>
+                </div>
+            </div>
+            """
+            buttons_options.append({'label': f'🛒 إضافة {name} للسلة', 'value': f'cart_{p_id}', 'color': 'success'})
+
+        cards_html += "</div>"
+        put_html(cards_html)
+        buttons_options.append({'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'})
+
+    render_footer()
+    
+    act = actions("اختر الإجراء:", buttons_options)
+    
+    if act == 'home':
+        main_menu()
+    elif isinstance(act, str) and act.startswith('cart_'):
+        add_to_cart(int(act.split('_')[1]))
+
+@require_auth
+def add_to_cart(product_id):
+    current_user = get_current_user()
+    if not current_user:
+        toast("يرجى تسجيل الدخول أولاً قبل الشراء.", color="error")
+        login_page()
+        return
+
+    qty_data = input_group("إضافة المنتج إلى السلة", [
+        input("الكمية المطلوبة:", name="qty", type=NUMBER, value=1, min=1, required=True)
+    ])
+    qty = int(qty_data['qty'])
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
+        prod = cursor.fetchone()
+
+        if prod:
+            cursor.execute("SELECT id, quantity FROM cart WHERE user_id = ? AND product_id = ?", (current_user['id'], product_id))
+            cart_item = cursor.fetchone()
+
+            if cart_item:
+                cursor.execute("UPDATE cart SET quantity = quantity + ? WHERE id = ?", (qty, cart_item['id']))
+            else:
+                cursor.execute(
+                    "INSERT INTO cart (user_id, product_id, name, price, quantity, image) VALUES (?, ?, ?, ?, ?, ?)",
+                    (current_user['id'], product_id, prod['name'], prod['price'], qty, prod['image'])
+                )
+            conn.commit()
+            toast(f"تمت إضافة ({qty}) قطعة من {prod['name']} إلى السلة بنجاح!", color="success")
+    user_shop()
+
+@require_auth
+def view_cart():
+    clear()
+    sync_session()
+    restore_currency()
+    render_header("سلة التسوق الخاصة بك")
+
+    current_user = get_current_user()
+    if not current_user:
+        login_page()
+        return
+
+    selected_currency = get_selected_currency()
+    curr_info = CURRENCIES[selected_currency]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.id, c.name, c.price, c.quantity, c.image, p.currency 
+            FROM cart c 
+            LEFT JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = ?
+        """, (current_user['id'],))
+        items = cursor.fetchall()
+
+    if not items:
+        put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center;'><h3>🛒 سلة التسوق فارغة حالياً.</h3></div>")
+    else:
+        table_data = [["الصورة", "العطر", "السعر الفردي", "الكمية", "الإجمالي"]]
+        grand_total = 0.0
+
+        for item in items:
+            item_curr = item['currency'] if item['currency'] else "EUR (€)"
+            converted_unit_price = convert_price(item['price'], item_curr, selected_currency)
+            total_item_price = converted_unit_price * item['quantity']
+            grand_total += total_item_price
+
+            img_html = f'<img src="{get_image_source(item["image"])}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
+            table_data.append([
+                put_html(img_html),
+                item['name'],
+                f"{converted_unit_price:,.2f} {curr_info['symbol']}",
+                str(item['quantity']),
+                f"{total_item_price:,.2f} {curr_info['symbol']}"
+            ])
+
+        put_table(table_data)
+        put_html(f"""
+            <div style="background: #ffffff; padding: 20px; border-radius: 12px; margin: 20px auto; max-width: 400px; text-align: center;">
+                <h3 style="margin: 0;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:,.2f} {curr_info['symbol']}</span></h3>
+            </div>
+        """)
+
+    render_footer()
+    act = actions("الخيارات المتاحة:", [
+        {'label': '📄 تحميل الفاتورة (PDF)', 'value': 'pdf', 'color': 'success'},
+        {'label': '🗑️ تفريغ السلة', 'value': 'clear_cart', 'color': 'danger'},
+        {'label': '🛍️ مواصلة التسوق', 'value': 'shop', 'color': 'primary'},
+        {'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
+    ])
+
+    if act == 'pdf': generate_pdf_invoice()
+    elif act == 'clear_cart': empty_user_cart()
+    elif act == 'shop': user_shop()
+    elif act == 'home': main_menu()
+
+@require_auth
+def empty_user_cart():
+    current_user = get_current_user()
+    if current_user:
+        with get_db_connection() as conn:
+            conn.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
+            conn.commit()
+        toast("تم تفريغ سلة التسوق بنجاح.", color="info")
+    view_cart()
+
+@require_auth
+def generate_pdf_invoice():
+    current_user = get_current_user()
+    if not current_user:
+        return
+
+    selected_currency = get_selected_currency()
+    curr_info = CURRENCIES[selected_currency]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.name, c.price, c.quantity, p.currency 
+            FROM cart c 
+            LEFT JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = ?
+        """, (current_user['id'],))
+        items = cursor.fetchall()
+
+    if not items:
+        toast("السلة فارغة، لا يمكن إنتاج فاتورة!", color="warning")
+        return
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A5, rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
+    story = []
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=16, alignment=1)
+    normal_style = ParagraphStyle('NormalStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=10, alignment=1)
+
+    story.append(Paragraph(f"<b>{STORE_BRAND}</b>", title_style))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph("OFFICIAL INVOICE / RECEIPT", normal_style))
+    story.append(Spacer(1, 10))
+
+    data = [["Item Description", "Price", "Qty", "Total"]]
+    grand_total = 0.0
+
+    for item in items:
+        item_curr = item['currency'] if item['currency'] else "EUR (€)"
+        price = convert_price(item['price'], item_curr, selected_currency)
+        total = price * item['quantity']
+        grand_total += total
+        data.append([item['name'], f"{price:,.2f} {curr_info['symbol']}", str(item['quantity']), f"{total:,.2f} {curr_info['symbol']}"])
+
+    data.append(["Grand Total", "", "", f"{grand_total:,.2f} {curr_info['symbol']}"])
+
+    t = Table(data, colWidths=[140, 70, 30, 80])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1a202c")),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e0")),
+        ('FONTNAME', (0,-1), (-1,-1), 'Helvetica-Bold'),
+    ]))
+
+    story.append(t)
+    doc.build(story)
+    download("Invoice_Parfum_RZ.pdf", buffer.getvalue())
+    toast("تم تحميل الفاتورة بنجاح!", color="success")
+
+# --- Protected Admin Dashboard ---
+
+@require_admin
+def download_database():
+    if not DB_NAME.exists():
+        toast("خطأ: ملف قاعدة البيانات غير موجود!", color="error")
+        return
+    with open(DB_NAME, "rb") as f:
+        db_bytes = f.read()
+    download("shop_db_backup.sqlite", db_bytes)
+    toast("تم تحميل نسخة من قاعدة البيانات بنجاح!", color="success")
+
+@require_admin
+def admin_dashboard():
+    clear()
+    sync_session()
+    restore_currency()
+    render_header("لوحة التحكم وإدارة العطور")
+
+    render_footer()
+
+    choice = actions("اختر العملية المطلوبة:", [
+        {'label': '➕ إضافة عطر جديد', 'value': 'add', 'color': 'success'},
+        {'label': '📋 عرض وتعديل قائمة العطور', 'value': 'list', 'color': 'primary'},
+        {'label': '💾 تحميل نسخة من قاعدة البيانات (DB)', 'value': 'download_db', 'color': 'info'},
+        {'label': '🔙 العودة للقائمة الرئيسية', 'value': 'home', 'color': 'secondary'}
+    ])
+
+    if choice == 'add': add_product_page()
+    elif choice == 'list': list_products_page()
+    elif choice == 'download_db': 
+        download_database()
+        admin_dashboard()
+    elif choice == 'home': main_menu()
+
+@require_admin
+def add_product_page():
+    clear()
+    render_header("إضافة عطر جديد إلى المتجر")
+
+    data = input_group("إضافة عطر جديد", [
+        input("اسم العطر", name="name", required=True),
+        input("السعر", name="price", type=NUMBER, required=True),
+        select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="DA (د.ج)"),
+        file_upload("صورة العطر", name="image", accept="image/*", required=True)
+    ])
+
+    image_path = save_uploaded_file(data['image'])
+
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
+            (data['name'].strip(), float(data['price']), data['currency'], image_path)
+        )
+        conn.commit()
+
+    toast("تمت إضافة العطر بنجاح!", color="success")
+    admin_dashboard()
+
+@require_admin
+def list_products_page():
+    clear()
+    sync_session()
+    restore_currency()
+    render_header("إدارة وتعديل العطور المسجلة")
+
+    selected_currency = get_selected_currency()
+    curr_info = CURRENCIES[selected_currency]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products")
+        products = cursor.fetchall()
+
+    if not products:
+        put_html("<div style='background: white; padding: 30px; margin: 20px auto; text-align: center;'><h3>لا توجد عطور متوفرة للتعديل.</h3></div>")
+    else:
+        table_data = [["المعرف", "الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
+        actions_list = []
+        for prod in products:
+            p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
+            img_path = prod['image']
+            disp_price = convert_price(base_price, item_currency, selected_currency)
+
+            img_html = f'<img src="{get_image_source(img_path)}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px;">'
+
+            table_data.append([
+                str(p_id),
+                put_html(img_html),
+                name,
+                f"{disp_price:,.2f} {curr_info['symbol']}",
+                f"تعديل: edit_{p_id} | حذف: del_{p_id}"
+            ])
+            actions_list.append({'label': f'✏️ تعديل {name}', 'value': f'edit_{p_id}', 'color': 'warning'})
+            actions_list.append({'label': f'🗑️ حذف {name}', 'value': f'del_{p_id}', 'color': 'danger'})
+
+        put_table(table_data)
+
+    render_footer()
+    
+    actions_list.append({'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'})
+    act = actions("اختر الإجراء للتعديل أو الحذف:", actions_list)
+    
+    if act == 'admin':
+        admin_dashboard()
+    elif isinstance(act, str) and act.startswith('del_'):
+        p_id = int(act.split('_')[1])
+        with get_db_connection() as conn:
+            conn.execute("DELETE FROM products WHERE id = ?", (p_id,))
+            conn.commit()
+        toast("تم حذف العطر بنجاح.", color="info")
+        list_products_page()
+    elif isinstance(act, str) and act.startswith('edit_'):
+        p_id = int(act.split('_')[1])
+        edit_product_page(p_id)
+
+@require_admin
+def edit_product_page(product_id):
+    clear()
+    render_header("تعديل بيانات العطر")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
+        product = cursor.fetchone()
+
+    if not product:
+        toast("العطر غير موجود!", color="error")
+        list_products_page()
+        return
+
+    data = input_group("تعديل العطر", [
+        input("اسم العطر", name="name", value=product['name'], required=True),
+        input("السعر", name="price", type=NUMBER, value=float(product['price']), required=True),
+        select("عملة السعر المسجلة", list(CURRENCIES.keys()), name="currency", value=product['currency']),
+        file_upload("تحديث صورة العطر (اختياري)", name="image", accept="image/*")
+    ])
+
+    image_path = product['image']
+    if data['image'] and data['image'].get('content'):
+        image_path = save_uploaded_file(data['image'])
+
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
+            (data['name'].strip(), float(data['price']), data['currency'], image_path, product_id)
+        )
+        conn.commit()
+
+    toast("تم تحديث بيانات العطر بنجاح!", color="success")
+    list_products_page()
+
+# --- Application Entry Point ---
+
+def app_main():
+    sync_session()
+    restore_currency()
+    main_menu()
+
+# --- WSGI App & Export Endpoint ---
+
+app = Flask(__name__)
+app.add_url_rule('/', 'webio_view', webio_view(app_main), methods=['GET', 'POST', 'OPTIONS'])
+
+@app.route('/healthz', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok", "timestamp": time.time()}), 200
+
+@app.route('/static/uploads/<filename>')
+def serve_upload(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+@app.route('/admin/export-db/<secret_key>', methods=['GET'])
+def export_database(secret_key):
+    if secret_key != DB_EXPORT_SECRET:
+        abort(403)
+    if DB_NAME.exists():
+        return send_file(
+            DB_NAME,
+            as_attachment=True,
+            download_name="shop_db.sqlite",
+            mimetype="application/x-sqlite3"
+        )
+    return jsonify({"error": "Database file not found"}), 404
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=PORT)
