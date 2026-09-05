@@ -31,7 +31,6 @@ STORE_PHONE = "0542932846"
 STORE_EMAIL = "contact@luxuryimpactparfum.com"
 STORE_WEBSITE = "https://www.luxuryimpactparfum.com"
 
-# Render Persistent Disk support or local fallback
 DATA_DIR = Path(os.environ.get("RENDER_DISK_PATH", "."))
 DB_NAME = DATA_DIR / "shop_db.sqlite"
 UPLOAD_DIR = DATA_DIR / "static" / "uploads"
@@ -184,6 +183,36 @@ def convert_price(amount, from_curr, to_curr):
 
 def render_header(subtitle=""):
     put_html(f"""
+        <style>
+            /* Global Table Styling to Fit QR Codes Comfortably */
+            table {{
+                width: 100% !important;
+                border-collapse: collapse !important;
+                margin-top: 15px !important;
+            }}
+            th, td {{
+                padding: 12px 16px !important;
+                vertical-align: middle !important;
+                text-align: center !important;
+            }}
+            
+            /* Custom Interactive Ingredient Link Styling */
+            .ingredient-link {{
+                color: #3182ce;
+                font-weight: bold;
+                text-decoration: underline;
+                transition: color 0.2s ease-in-out;
+            }}
+            .ingredient-link:hover {{
+                color: #2b6cb0;
+            }}
+            .ingredient-link:active {{
+                color: #e53e3e; /* Highlights Red on click/press */
+            }}
+            .ingredient-link:visited {{
+                color: #805ad5; /* Purple after being visited */
+            }}
+        </style>
         <div style="background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); color: white; padding: 20px; border-radius: 12px; margin-bottom: 25px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
             <h1 style="margin: 0; font-size: 28px; font-weight: 900; letter-spacing: 1px;">✨ {STORE_BRAND} ✨</h1>
             <p style="margin: 5px 0 0 0; font-size: 14px; opacity: 0.8;">{subtitle}</p>
@@ -191,7 +220,6 @@ def render_header(subtitle=""):
     """)
 
 def render_footer():
-    """Renders website link footer at the bottom of the page."""
     put_html(f"""
         <div style="margin-top: 40px; padding: 15px; text-align: center; border-top: 1px solid #e2e8f0; font-size: 14px; color: #4a5568;">
             🌐 زيارة موقعنا الرسمي: <a href="{STORE_WEBSITE}" target="_blank" style="color: #3182ce; font-weight: bold; text-decoration: none;">{STORE_WEBSITE}</a>
@@ -312,24 +340,26 @@ def user_shop():
     if not products:
         put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
     else:
-        table_data = [["الصورة", "العطر والمعلومات", "QR Code", f"السعر ({curr_info['symbol']})", "الإجراء"]]
+        table_data = [["الصورة", "العطر والمعلومات", "رمز QR", f"السعر ({curr_info['symbol']})", "الإجراء"]]
         for prod in products:
             p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
             img_path = prod['image']
             
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
-            img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
+            img_html = f'<img src="{img_src}" style="width: 80px; height: 80px; object-fit: cover; border-radius: 8px;">'
 
             qr_svg = generate_product_qr_svg(name)
-            qr_html = f'<div style="width: 80px; height: 80px;">{qr_svg}</div>'
+            qr_html = f'<div style="width: 100px; height: 100px; margin: auto;">{qr_svg}</div>'
 
             search_url = get_ingredient_search_url(name)
 
             details_html = f"""
-                <b>{name}</b><br/>
-                <small style="color: #718096;"><b>الهاتف:</b> {STORE_PHONE}</small><br/>
-                <small>🔍 <a href="{search_url}" target="_blank" style="color: #3182ce; text-decoration: none; font-weight: bold;">البحث عن المكونات عبر الإنترنت</a></small>
+                <div style="text-align: right; line-height: 1.6;">
+                    <b style="font-size: 16px;">{name}</b><br/>
+                    <small style="color: #718096;"><b>الهاتف:</b> {STORE_PHONE}</small><br/>
+                    <a href="{search_url}" target="_blank" class="ingredient-link">المكونات</a>
+                </div>
             """
 
             table_data.append([
@@ -339,6 +369,7 @@ def user_shop():
                 f"{disp_price:,.2f} {curr_info['symbol']}",
                 put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}], onclick=lambda val: add_to_cart(val))
             ])
+        
         put_table(table_data)
 
     act = actions("", [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}])
@@ -646,7 +677,6 @@ app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST
 
 @app.route('/healthz', methods=['GET'])
 def health_check():
-    """Endpoint for uptime monitors (UptimeRobot, cron-job.org) to keep instance awake."""
     return jsonify({"status": "ok", "timestamp": time.time()}), 200
 
 @app.route('/static/uploads/<filename>')
