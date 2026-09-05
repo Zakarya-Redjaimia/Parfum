@@ -191,22 +191,15 @@ def convert_price(amount, from_curr, to_curr):
 def render_header(subtitle=""):
     put_html(f"""
         <style>
-            /* Custom Interactive Ingredient Link Styling */
             .ingredient-link {{
                 color: #3182ce;
                 font-weight: bold;
                 text-decoration: underline;
                 transition: color 0.2s ease-in-out;
             }}
-            .ingredient-link:hover {{
-                color: #2b6cb0;
-            }}
-            .ingredient-link:active {{
-                color: #e53e3e; /* Red highlight on click */
-            }}
-            .ingredient-link:visited {{
-                color: #805ad5; /* Purple after visited */
-            }}
+            .ingredient-link:hover {{ color: #2b6cb0; }}
+            .ingredient-link:active {{ color: #e53e3e; }}
+            .ingredient-link:visited {{ color: #805ad5; }}
         </style>
         <div style="background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%); color: white; padding: 20px; border-radius: 12px; margin-bottom: 25px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
             <h1 style="margin: 0; font-size: 28px; font-weight: 900; letter-spacing: 1px;">✨ {STORE_BRAND} ✨</h1>
@@ -215,6 +208,7 @@ def render_header(subtitle=""):
     """)
 
 def render_footer():
+    """Renders the website link footer strictly once at the absolute bottom."""
     put_html(f"""
         <div style="margin-top: 40px; padding: 15px; text-align: center; border-top: 1px solid #e2e8f0; font-size: 14px; color: #4a5568;">
             🌐 زيارة موقعنا الرسمي: <a href="{STORE_WEBSITE}" target="_blank" style="color: #3182ce; font-weight: bold; text-decoration: none;">{STORE_WEBSITE}</a>
@@ -246,17 +240,20 @@ def main_menu():
 
     choice = actions("القائمة الرئيسية:", options)
 
-    if choice == 'shop': user_shop()
-    elif choice == 'cart': view_cart()
-    elif choice == 'admin': admin_dashboard()
-    elif choice == 'login': login_page()
-    elif choice == 'register': register_page()
+    if choice == 'shop':
+        user_shop()
+    elif choice == 'cart':
+        view_cart()
+    elif choice == 'admin':
+        admin_dashboard()
+    elif choice == 'login':
+        login_page()
+    elif choice == 'register':
+        register_page()
     elif choice == 'logout':
         set_current_user(None)
         toast("تم تسجيل الخروج وتأمين الجلسة بنجاح.", color="info")
         main_menu()
-
-    render_footer()
 
 # --- Auth System ---
 
@@ -264,7 +261,6 @@ def register_page():
     clear()
     render_header("إنشاء حساب جديد")
 
-    # Only offer Admin option if no Admin account exists yet
     role_options = [("مستخدم عادي", "user")]
     if not admin_exists():
         role_options.append(("مدير النظام (حساب واحد فقط متاح)", "admin"))
@@ -276,7 +272,6 @@ def register_page():
         select("نوع الحساب", role_options, name="role")
     ])
 
-    # Double-check single admin rule on submission
     selected_role = data['role']
     if selected_role == 'admin' and admin_exists():
         toast("خطأ: يوجد مدير نظام مسجل بالفعل! تم تحويل حسابك إلى مستخدم عادي.", color="warning")
@@ -297,8 +292,6 @@ def register_page():
         except sqlite3.IntegrityError:
             toast("اسم المستخدم هذا مستخدم بالفعل. يرجى اختيار اسم آخر.", color="error")
             register_page()
-
-    render_footer()
 
 def login_page():
     clear()
@@ -326,8 +319,6 @@ def login_page():
     else:
         toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
         login_page()
-
-    render_footer()
 
 # --- Protected Store & Cart Views ---
 
@@ -376,13 +367,11 @@ def user_shop():
                 put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}], onclick=lambda val: add_to_cart(val))
             ])
         
-        # Standard PyWebIO table without unnatural width restrictions
         put_table(table_data)
 
+    render_footer()
     act = actions("", [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}])
     if act == 'home': main_menu()
-
-    render_footer()
 
 @require_auth
 def add_to_cart(product_id):
@@ -459,6 +448,7 @@ def view_cart():
             </div>
         """)
 
+    render_footer()
     act = actions("الخيارات المتاحة:", [
         {'label': '📄 تحميل الفاتورة (PDF)', 'value': 'pdf', 'color': 'success'},
         {'label': '🗑️ تفريغ السلة', 'value': 'clear_cart', 'color': 'danger'},
@@ -470,8 +460,6 @@ def view_cart():
     elif act == 'clear_cart': empty_user_cart()
     elif act == 'shop': user_shop()
     elif act == 'home': main_menu()
-
-    render_footer()
 
 @require_auth
 def empty_user_cart():
@@ -621,10 +609,9 @@ def list_products_page():
 
         put_table(table_data)
 
+    render_footer()
     act = actions("", [{'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'}])
     if act == 'admin': admin_dashboard()
-
-    render_footer()
 
 def handle_action(action_value):
     action, p_id = action_value.split('_')
@@ -674,8 +661,6 @@ def edit_product_page(product_id):
 
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
-
-    render_footer()
 
 # --- WSGI App Definition & Health Route ---
 
