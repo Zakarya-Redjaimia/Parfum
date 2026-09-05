@@ -13,7 +13,7 @@ import qrcode.image.svg
 from flask import Flask, send_from_directory, jsonify, send_file, abort
 from pywebio.platform.flask import webio_view
 from pywebio.session import local as session_local, eval_js, run_js
-from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
+from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, PASSWORD, actions
 from pywebio.output import (
     clear, put_html, put_table, put_buttons, toast, download
 )
@@ -138,7 +138,7 @@ def admin_exists():
         cursor.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
         return cursor.fetchone() is not None
 
-# --- Robust Session Persistence ---
+# --- Robust Session Persistence & Navigation ---
 
 def get_current_user():
     return getattr(session_local, 'user', None)
@@ -298,7 +298,7 @@ def register_page():
         input("الاسم الكامل", name="name", required=True),
         input("اسم المستخدم", name="username", required=True),
         input("البريد الإلكتروني", name="email", type=TEXT, required=True),
-        input("كلمة المرور", name="password", type=TEXT, required=True),
+        input("كلمة المرور", name="password", type=PASSWORD, required=True),
         select("نوع الحساب", role_options, name="role")
     ])
 
@@ -333,7 +333,7 @@ def login_page():
 
     data = input_group("أدخل بيانات الاعتماد", [
         input("اسم المستخدم أو البريد الإلكتروني", name="login_id", required=True),
-        input("كلمة المرور", name="password", type=TEXT, required=True)
+        input("كلمة المرور", name="password", type=PASSWORD, required=True)
     ])
 
     login_id = data['login_id'].strip()
@@ -546,7 +546,7 @@ def empty_user_cart():
         with get_db_connection() as conn:
             conn.execute("DELETE FROM cart WHERE user_id = ?", (current_user['id'],))
             conn.commit()
-        toast("تم تفريغ سلة التسوق بنجاح.", color="info")
+            toast("تم تفريغ سلة التسوق بنجاح.", color="info")
     view_cart()
 
 @require_auth
