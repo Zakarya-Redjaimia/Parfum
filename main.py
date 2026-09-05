@@ -51,7 +51,6 @@ def get_db_connection():
 
 def init_db():
     with get_db_connection() as conn:
-        # Schema updated to store username, email, hashed password, name, and role
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +61,6 @@ def init_db():
                 role TEXT DEFAULT 'user'
             )
         """)
-        # Schema for storing perfume products and prices
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,7 +70,6 @@ def init_db():
                 image TEXT
             )
         """)
-        # Schema for shopping cart data
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cart (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -337,11 +334,11 @@ def login_page():
         toast("خطأ: بيانات الدخول أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
-# --- Protected Store & Cart Views ---
+# --- Horizontal Grid Marketplace View ---
 
 def user_shop():
     clear()
-    render_header("تصفح قائمة العطور")
+    render_header("تصفح قائمة العطور المعروضة في المتجر")
 
     selected_currency = get_selected_currency()
     curr_info = CURRENCIES[selected_currency]
@@ -354,41 +351,67 @@ def user_shop():
     if not products:
         put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
     else:
-        table_data = [["الصورة", "العطر والمعلومات", "رمز QR", f"السعر ({curr_info['symbol']})", "الإجراء"]]
+        # Container with Flexbox layout to align product cards horizontally side-by-side
+        cards_html = """
+        <div style="
+            display: flex; 
+            flex-wrap: wrap; 
+            gap: 20px; 
+            justify-content: center; 
+            padding: 10px; 
+            direction: rtl;
+        ">
+        """
+
+        buttons_options = []
+
         for prod in products:
             p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
-            img_path = prod['image']
-            
-            img_src = get_image_source(img_path)
+            img_src = get_image_source(prod['image'])
             disp_price = convert_price(base_price, item_currency, selected_currency)
-            img_html = f'<img src="{img_src}" style="width: 80px; height: 80px; object-fit: cover; border-radius: 8px;">'
-
-            qr_svg = generate_product_qr_svg(name)
-            qr_html = f'<div style="width: 80px; height: 80px; margin: auto;">{qr_svg}</div>'
-
             search_url = get_ingredient_search_url(name)
+            qr_svg = generate_product_qr_svg(name)
 
-            details_html = f"""
-                <div style="text-align: right; line-height: 1.5;">
-                    <b style="font-size: 15px;">{name}</b><br/>
-                    <small style="color: #718096;"><b>الهاتف:</b> {STORE_PHONE}</small><br/>
-                    <a href="{search_url}" target="_blank" class="ingredient-link">المكونات</a>
+            cards_html += f"""
+            <div style="
+                background: #ffffff; 
+                border: 1px solid #e2e8f0; 
+                border-radius: 12px; 
+                width: 260px; 
+                box-shadow: 0 4px 10px rgba(0,0,0,0.05); 
+                padding: 15px; 
+                text-align: center; 
+                display: flex; 
+                flex-direction: column; 
+                justify-content: space-between;
+            ">
+                <div>
+                    <img src="{img_src}" style="width: 100%; height: 180px; object-fit: cover; border-radius: 8px; margin-bottom: 10px;">
+                    <h3 style="margin: 8px 0; font-size: 18px; color: #1a202c;">{name}</h3>
+                    <p style="color: #2b6cb0; font-weight: bold; font-size: 16px; margin: 5px 0;">
+                        {disp_price:,.2f} {curr_info['symbol']}
+                    </p>
+                    <small style="color: #718096; display: block; margin-bottom: 5px;"><b>الهاتف:</b> {STORE_PHONE}</small>
+                    <a href="{search_url}" target="_blank" class="ingredient-link" style="display: inline-block; margin: 5px 0;">🔍 المكونات</a>
+                    <div style="width: 75px; height: 75px; margin: 10px auto;">{qr_svg}</div>
                 </div>
+            </div>
             """
+            buttons_options.append({'label': f'🛒 إضافة {name} للسلة', 'value': f'cart_{p_id}', 'color': 'success'})
 
-            table_data.append([
-                put_html(img_html),
-                put_html(details_html),
-                put_html(qr_html),
-                f"{disp_price:,.2f} {curr_info['symbol']}",
-                put_buttons([{'label': '🛒 إضافة للسلة', 'value': p_id, 'color': 'success'}], onclick=lambda val: add_to_cart(val))
-            ])
+        cards_html += "</div>"
+        put_html(cards_html)
         
-        put_table(table_data)
-
-    render_footer()
-    act = actions("", [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}])
-    if act == 'home': main_menu()
+        buttons_options.append({'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'})
+        
+        render_footer()
+        
+        act = actions("اختر العطر لإضافته للسلة:", buttons_options)
+        
+        if act == 'home':
+            main_menu()
+        elif isinstance(act, str) and act.startswith('cart_'):
+            add_to_cart(int(act.split('_')[1]))
 
 @require_auth
 def add_to_cart(product_id):
@@ -417,6 +440,7 @@ def add_to_cart(product_id):
                 )
             conn.commit()
             toast(f"تمت إضافة ({qty}) قطعة من {prod['name']} إلى السلة بنجاح!", color="success")
+    user_shop()
 
 @require_auth
 def view_cart():
