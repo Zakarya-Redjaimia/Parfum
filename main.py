@@ -619,18 +619,19 @@ def edit_product_page(product_id):
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- WSGI & Health Endpoint Setup ---
-# Create the Flask app instance
-flask_app = Flask(__name__)
-flask_app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
+# --- WSGI App Definition & Health Route ---
 
-@flask_app.route('/healthz', methods=['GET'])
+app = Flask(__name__)
+app.add_url_rule('/', 'webio_view', webio_view(main_menu), methods=['GET', 'POST', 'OPTIONS'])
+
+@app.route('/healthz', methods=['GET'])
 def health_check():
+    """Endpoint for uptime monitors (UptimeRobot, cron-job.org) to keep instance awake."""
     return jsonify({"status": "ok", "timestamp": time.time()}), 200
 
-@flask_app.route('/static/uploads/<filename>')
+@app.route('/static/uploads/<filename>')
 def serve_upload(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
 if __name__ == '__main__':
-    flask_app.run(host='0.0.0.0', port=PORT)
+    app.run(host='0.0.0.0', port=PORT)
