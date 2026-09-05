@@ -13,7 +13,7 @@ import qrcode.image.svg
 from flask import Flask, send_from_directory, jsonify
 from pywebio.platform.flask import webio_view
 from pywebio.session import local as session_local
-from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, textarea, actions
+from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
 from pywebio.output import (
     clear, put_html, put_table, put_buttons, toast, download
 )
@@ -27,7 +27,7 @@ from io import BytesIO
 
 PORT = int(os.environ.get("PORT", 8080))
 STORE_BRAND = "Luxury Impact Parfum RZ"
-STORE_PHONE = "+213 550 00 00 00"
+STORE_PHONE = "0542932846"
 STORE_EMAIL = "contact@luxuryimpactparfum.com"
 STORE_WEBSITE = "https://www.luxuryimpactparfum.com"
 
@@ -67,20 +67,9 @@ def init_db():
                 name TEXT NOT NULL,
                 price REAL NOT NULL,
                 currency TEXT NOT NULL,
-                image TEXT,
-                ingredients TEXT,
-                phone TEXT
+                image TEXT
             )
         """)
-        
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(products)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'ingredients' not in columns:
-            cursor.execute("ALTER TABLE products ADD COLUMN ingredients TEXT")
-        if 'phone' not in columns:
-            cursor.execute("ALTER TABLE products ADD COLUMN phone TEXT")
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cart (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,20 +89,22 @@ init_db()
 
 # --- Utility Functions ---
 
-def generate_product_qr_svg(product_name, phone=None):
-    """
-    Generates an SVG QR code encoding the online ingredient search URL,
-    contact email, and contact phone number.
-    """
-    contact_phone = phone.strip() if phone else STORE_PHONE
+def get_ingredient_search_url(product_name):
+    """Generates the Google Search URL for perfume ingredients."""
     search_query = f"{product_name} perfume ingredients notes"
     encoded_query = urllib.parse.quote_plus(search_query)
-    search_url = f"https://www.google.com/search?q={encoded_query}"
+    return f"https://www.google.com/search?q={encoded_query}"
+
+def generate_product_qr_svg(product_name):
+    """Generates an SVG QR code encoding brand, perfume, phone, email, and ingredient search URL."""
+    search_url = get_ingredient_search_url(product_name)
     
     qr_payload = (
-        f"Search: {search_url}\n"
-        f"Phone: {contact_phone}\n"
-        f"Email: {STORE_EMAIL}"
+        f"Brand: {STORE_BRAND}\n"
+        f"Perfume: {product_name}\n"
+        f"Phone: {STORE_PHONE}\n"
+        f"Admin Email: {STORE_EMAIL}\n"
+        f"Ingredients Link: {search_url}"
     )
     
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
@@ -315,7 +306,7 @@ def user_shop():
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, price, currency, image, phone FROM products")
+        cursor.execute("SELECT id, name, price, currency, image FROM products")
         products = cursor.fetchall()
 
     if not products:
@@ -324,18 +315,21 @@ def user_shop():
         table_data = [["الصورة", "العطر والمعلومات", "QR Code", f"السعر ({curr_info['symbol']})", "الإجراء"]]
         for prod in products:
             p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
-            img_path, phone = prod['image'], prod['phone']
+            img_path = prod['image']
             
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
 
-            qr_svg = generate_product_qr_svg(name, phone)
+            qr_svg = generate_product_qr_svg(name)
             qr_html = f'<div style="width: 80px; height: 80px;">{qr_svg}</div>'
+
+            search_url = get_ingredient_search_url(name)
 
             details_html = f"""
                 <b>{name}</b><br/>
-                <small style="color: #718096;"><b>الهاتف:</b> {phone or STORE_PHONE}</small>
+                <small style="color: #718096;"><b>الهاتف:</b> {STORE_PHONE}</small><br/>
+                <small>🔍 <a href="{search_url}" target="_blank" style="color: #3182ce; text-decoration: none; font-weight: bold;">البحث عن المكونات عبر الإنترنت</a></small>
             """
 
             table_data.append([
@@ -537,8 +531,6 @@ def add_product_page():
         input("اسم العطر", name="name", required=True),
         input("السعر", name="price", type=NUMBER, required=True),
         select("عملة السعر الإدخالي", list(CURRENCIES.keys()), name="currency", value="DA (د.ج)"),
-        textarea("المكونات (Ingredients)", name="ingredients", placeholder="مثل: Bergamot, Jasmine, Amber...", required=True),
-        input("رقم هاتف الطلب/التواصل", name="phone", value=STORE_PHONE, required=True),
         file_upload("صورة العطر", name="image", accept="image/*", required=True)
     ])
 
@@ -546,8 +538,8 @@ def add_product_page():
 
     with get_db_connection() as conn:
         conn.execute(
-            "INSERT INTO products (name, price, currency, image, ingredients, phone) VALUES (?, ?, ?, ?, ?, ?)",
-            (data['name'].strip(), float(data['price']), data['currency'], image_path, data['ingredients'].strip(), data['phone'].strip())
+            "INSERT INTO products (name, price, currency, image) VALUES (?, ?, ?, ?)",
+            (data['name'].strip(), float(data['price']), data['currency'], image_path)
         )
         conn.commit()
 
@@ -564,7 +556,7 @@ def list_products_page():
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, price, currency, image, phone FROM products")
+        cursor.execute("SELECT id, name, price, currency, image FROM products")
         products = cursor.fetchall()
 
     if not products:
@@ -616,7 +608,7 @@ def edit_product_page(product_id):
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, price, currency, image, ingredients, phone FROM products WHERE id = ?", (product_id,))
+        cursor.execute("SELECT id, name, price, currency, image FROM products WHERE id = ?", (product_id,))
         product = cursor.fetchone()
 
     if not product:
@@ -628,8 +620,6 @@ def edit_product_page(product_id):
         input("اسم العطر", name="name", value=product['name'], required=True),
         input("السعر", name="price", type=NUMBER, value=float(product['price']), required=True),
         select("عملة السعر المسجلة", list(CURRENCIES.keys()), name="currency", value=product['currency']),
-        textarea("المكونات (Ingredients)", name="ingredients", value=product['ingredients'] or "", required=True),
-        input("رقم هاتف التواصل", name="phone", value=product['phone'] or STORE_PHONE, required=True),
         file_upload("تحديث صورة العطر (اختياري)", name="image", accept="image/*")
     ])
 
@@ -639,8 +629,8 @@ def edit_product_page(product_id):
 
     with get_db_connection() as conn:
         conn.execute(
-            "UPDATE products SET name = ?, price = ?, currency = ?, image = ?, ingredients = ?, phone = ? WHERE id = ?",
-            (data['name'].strip(), float(data['price']), data['currency'], image_path, data['ingredients'].strip(), data['phone'].strip(), product_id)
+            "UPDATE products SET name = ?, price = ?, currency = ?, image = ? WHERE id = ?",
+            (data['name'].strip(), float(data['price']), data['currency'], image_path, product_id)
         )
         conn.commit()
 
