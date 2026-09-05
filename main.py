@@ -28,6 +28,8 @@ from io import BytesIO
 PORT = int(os.environ.get("PORT", 8080))
 STORE_BRAND = "Luxury Impact Parfum RZ"
 STORE_PHONE = "+213 550 00 00 00"
+STORE_EMAIL = "contact@luxuryimpactparfum.com"
+STORE_WEBSITE = "https://www.luxuryimpactparfum.com"
 
 # Render Persistent Disk support or local fallback
 DATA_DIR = Path(os.environ.get("RENDER_DISK_PATH", "."))
@@ -98,14 +100,21 @@ init_db()
 
 # --- Utility Functions ---
 
-def generate_product_qr_svg(product_name, ingredients=None, phone=None):
+def generate_product_qr_svg(product_name, phone=None):
     """
-    Generates an SVG QR code encoding ONLY a dynamic Google search URL 
-    linking directly to the product's perfume ingredients/notes online.
+    Generates an SVG QR code encoding the online ingredient search URL,
+    contact email, and contact phone number.
     """
+    contact_phone = phone.strip() if phone else STORE_PHONE
     search_query = f"{product_name} perfume ingredients notes"
     encoded_query = urllib.parse.quote_plus(search_query)
-    qr_payload = f"https://www.google.com/search?q={encoded_query}"
+    search_url = f"https://www.google.com/search?q={encoded_query}"
+    
+    qr_payload = (
+        f"Search: {search_url}\n"
+        f"Phone: {contact_phone}\n"
+        f"Email: {STORE_EMAIL}"
+    )
     
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
     qr.add_data(qr_payload)
@@ -190,6 +199,14 @@ def render_header(subtitle=""):
         </div>
     """)
 
+def render_footer():
+    """Renders website link footer at the bottom of the page."""
+    put_html(f"""
+        <div style="margin-top: 40px; padding: 15px; text-align: center; border-top: 1px solid #e2e8f0; font-size: 14px; color: #4a5568;">
+            🌐 زيارة موقعنا الرسمي: <a href="{STORE_WEBSITE}" target="_blank" style="color: #3182ce; font-weight: bold; text-decoration: none;">{STORE_WEBSITE}</a>
+        </div>
+    """)
+
 # --- Main Flow & Views ---
 
 def main_menu():
@@ -225,6 +242,8 @@ def main_menu():
         toast("تم تسجيل الخروج وتأمين الجلسة بنجاح.", color="info")
         main_menu()
 
+    render_footer()
+
 # --- Auth System ---
 
 def register_page():
@@ -254,6 +273,8 @@ def register_page():
             toast("اسم المستخدم هذا مستخدم بالفعل. يرجى اختيار اسم آخر.", color="error")
             register_page()
 
+    render_footer()
+
 def login_page():
     clear()
     render_header("تسجيل الدخول الآمن")
@@ -281,6 +302,8 @@ def login_page():
         toast("خطأ: اسم المستخدم أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
+    render_footer()
+
 # --- Protected Store & Cart Views ---
 
 def user_shop():
@@ -292,7 +315,7 @@ def user_shop():
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, price, currency, image, ingredients, phone FROM products")
+        cursor.execute("SELECT id, name, price, currency, image, phone FROM products")
         products = cursor.fetchall()
 
     if not products:
@@ -301,18 +324,17 @@ def user_shop():
         table_data = [["الصورة", "العطر والمعلومات", "QR Code", f"السعر ({curr_info['symbol']})", "الإجراء"]]
         for prod in products:
             p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
-            img_path, ingredients, phone = prod['image'], prod['ingredients'], prod['phone']
+            img_path, phone = prod['image'], prod['phone']
             
             img_src = get_image_source(img_path)
             disp_price = convert_price(base_price, item_currency, selected_currency)
             img_html = f'<img src="{img_src}" style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px;">'
 
-            qr_svg = generate_product_qr_svg(name)
+            qr_svg = generate_product_qr_svg(name, phone)
             qr_html = f'<div style="width: 80px; height: 80px;">{qr_svg}</div>'
 
             details_html = f"""
                 <b>{name}</b><br/>
-                <small style="color: #718096;"><b>المكونات:</b> {ingredients or 'غير مسجلة'}</small><br/>
                 <small style="color: #718096;"><b>الهاتف:</b> {phone or STORE_PHONE}</small>
             """
 
@@ -327,6 +349,8 @@ def user_shop():
 
     act = actions("", [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}])
     if act == 'home': main_menu()
+
+    render_footer()
 
 @require_auth
 def add_to_cart(product_id):
@@ -415,6 +439,8 @@ def view_cart():
     elif act == 'shop': user_shop()
     elif act == 'home': main_menu()
 
+    render_footer()
+
 @require_auth
 def empty_user_cart():
     current_user = get_current_user()
@@ -500,6 +526,8 @@ def admin_dashboard():
     elif choice == 'list': list_products_page()
     elif choice == 'home': main_menu()
 
+    render_footer()
+
 @require_admin
 def add_product_page():
     clear()
@@ -536,16 +564,16 @@ def list_products_page():
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, price, currency, image, ingredients, phone FROM products")
+        cursor.execute("SELECT id, name, price, currency, image, phone FROM products")
         products = cursor.fetchall()
 
     if not products:
         put_html("<div style='background: white; padding: 30px; margin: 20px auto; text-align: center;'><h3>لا توجد عطور متوفرة للتعديل.</h3></div>")
     else:
-        table_data = [["المعرف", "الصورة", "اسم العطر", "المكونات", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
+        table_data = [["المعرف", "الصورة", "اسم العطر", f"السعر ({curr_info['symbol']})", "الإجراءات"]]
         for prod in products:
             p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
-            img_path, ingredients = prod['image'], prod['ingredients']
+            img_path = prod['image']
             disp_price = convert_price(base_price, item_currency, selected_currency)
 
             img_html = f'<img src="{get_image_source(img_path)}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px;">'
@@ -554,7 +582,6 @@ def list_products_page():
                 str(p_id),
                 put_html(img_html),
                 name,
-                ingredients or "-",
                 f"{disp_price:,.2f} {curr_info['symbol']}",
                 put_buttons([
                     {'label': '✏️ تعديل', 'value': f'edit_{p_id}', 'color': 'warning'},
@@ -566,6 +593,8 @@ def list_products_page():
 
     act = actions("", [{'label': '🔙 العودة للوحة التحكم', 'value': 'admin', 'color': 'secondary'}])
     if act == 'admin': admin_dashboard()
+
+    render_footer()
 
 def handle_action(action_value):
     action, p_id = action_value.split('_')
@@ -617,6 +646,8 @@ def edit_product_page(product_id):
 
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
+
+    render_footer()
 
 # --- WSGI App Definition & Health Route ---
 
