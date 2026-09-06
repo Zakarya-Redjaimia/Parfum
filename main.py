@@ -125,7 +125,7 @@ def enable_password_toggle(input_names):
                 btn.onclick = () => {{
                     if (inputElem.type === 'password') {{
                         inputElem.type = 'text';
-                        btn.innerText = '🙈 Unseen';
+                        btn.innerText = '🔒 Unseen';
                     }} else {{
                         inputElem.type = 'password';
                         btn.innerText = '👁️ Seen';
@@ -188,7 +188,7 @@ def admin_exists():
         cursor.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
         return cursor.fetchone() is not None
 
-# --- Robust Session Persistence Fix ---
+# --- Session Persistence & Controls ---
 
 def get_current_user():
     return getattr(session_local, 'user', None)
