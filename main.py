@@ -43,6 +43,8 @@ CURRENCIES = {
     "USD ($)": {"rate": 1.08, "symbol": "$"}
 }
 
+ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
+
 # --- Database Initialization ---
 
 def get_db_connection():
@@ -90,6 +92,48 @@ init_db()
 
 # --- Utility Functions ---
 
+def enable_password_toggle(input_names):
+    """Dynamically converts specified text inputs into password fields with a visibility toggle button."""
+    js_code = f"""
+    setTimeout(() => {{
+        const names = {input_names};
+        names.forEach(name => {{
+            const inputElem = document.querySelector(`input[name="${{name}}"]`);
+            if (inputElem) {{
+                inputElem.type = 'password';
+                
+                if (inputElem.nextElementSibling && inputElem.nextElementSibling.classList.contains('pw-toggle-btn')) return;
+                
+                const wrapper = inputElem.parentElement;
+                if (wrapper) wrapper.style.position = 'relative';
+
+                const btn = document.createElement('span');
+                btn.className = 'pw-toggle-btn';
+                btn.innerText = '👁️';
+                btn.style.position = 'absolute';
+                btn.style.left = '10px';
+                btn.style.top = '50%';
+                btn.style.transform = 'translateY(-50%)';
+                btn.style.cursor = 'pointer';
+                btn.style.userSelect = 'none';
+                btn.style.zIndex = '10';
+
+                btn.onclick = () => {{
+                    if (inputElem.type === 'password') {{
+                        inputElem.type = 'text';
+                        btn.innerText = '🙈';
+                    }} else {{
+                        inputElem.type = 'password';
+                        btn.innerText = '👁️';
+                    }}
+                }};
+                inputElem.after(btn);
+            }}
+        }});
+    }}, 100);
+    """
+    run_js(js_code)
+
 def get_ingredient_search_url(product_name):
     search_query = f"{product_name} perfume ingredients notes"
     encoded_query = urllib.parse.quote_plus(search_query)
@@ -116,7 +160,9 @@ def save_uploaded_file(file_data):
     if not file_data or 'content' not in file_data:
         return ""
     original_name = file_data.get('filename', 'image.jpg')
-    ext = Path(original_name).suffix or '.jpg'
+    ext = Path(original_name).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        ext = '.jpg'
     filename = secure_filename(f"{int(time.time())}_{os.urandom(4).hex()}{ext}")
     file_path = UPLOAD_DIR / filename
     with open(file_path, "wb") as f:
@@ -305,6 +351,8 @@ def register_page():
     if not admin_exists():
         role_options.append(("مدير النظام (حساب واحد فقط متاح)", "admin"))
 
+    enable_password_toggle(['password'])
+
     data = input_group("تسجيل حساب جديد", [
         input("الاسم الكامل", name="name", required=True),
         input("اسم المستخدم", name="username", required=True),
@@ -341,6 +389,8 @@ def register_page():
 def login_page():
     clear()
     render_header("تسجيل الدخول الآمن")
+
+    enable_password_toggle(['password'])
 
     data = input_group("أدخل بيانات الاعتماد", [
         input("اسم المستخدم أو البريد الإلكتروني", name="login_id", required=True),
