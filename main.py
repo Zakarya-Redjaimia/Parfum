@@ -486,7 +486,6 @@ def user_shop():
                     <p style="color: #2b6cb0; font-weight: bold; font-size: 16px; margin: 5px 0;">
                         {disp_price:,.2f} {curr_info['symbol']}
                     </p>
-                    <small style="color: #718096; display: block; margin-bottom: 5px;"><b>الهاتف:</b> {STORE_PHONE}</small>
                     <a href="{search_url}" target="_blank" class="ingredient-link" style="display: inline-block; margin: 5px 0;">🔍 المكونات</a>
                     <div style="width: 75px; height: 75px; margin: 10px auto;">{qr_svg}</div>
                 </div>
