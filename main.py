@@ -15,7 +15,7 @@ from pywebio.platform.flask import webio_view
 from pywebio.session import local as session_local, eval_js, run_js
 from pywebio.input import input, input_group, select, file_upload, NUMBER, TEXT, actions
 from pywebio.output import (
-    clear, put_html, put_table, put_buttons, toast, download
+    clear, put_html, put_table, toast, download
 )
 from reportlab.lib.pagesizes import A5
 from reportlab.lib import colors
@@ -49,6 +49,7 @@ ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME, timeout=10)
+    conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -422,7 +423,9 @@ def login_page():
         set_selected_currency(currency_choice)
         
         toast(f"مرحباً بك {user['name']}!", color="success")
-        main_menu()
+        
+        # Directly redirect to the product showcase after login
+        user_shop()
     else:
         toast("خطأ: بيانات الدخول أو كلمة المرور غير صحيحة!", color="error")
         login_page()
@@ -443,9 +446,10 @@ def user_shop():
         cursor.execute("SELECT id, name, price, currency, image FROM products")
         products = cursor.fetchall()
 
+    buttons_options = []
+
     if not products:
         put_html("<div style='background: white; padding: 40px; border-radius: 12px; margin: 30px auto; text-align: center;'><h3>لا توجد عطور معروضة حالياً.</h3></div>")
-        buttons_options = [{'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'}]
     else:
         cards_html = """
         <div style="
@@ -457,8 +461,6 @@ def user_shop():
             direction: rtl;
         ">
         """
-
-        buttons_options = []
 
         for prod in products:
             p_id, name, base_price, item_currency = prod['id'], prod['name'], prod['price'], prod['currency']
@@ -495,7 +497,10 @@ def user_shop():
 
         cards_html += "</div>"
         put_html(cards_html)
-        buttons_options.append({'label': '🔙 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'})
+
+    if get_current_user():
+        buttons_options.append({'label': '🛒 عرض سلة التسوق', 'value': 'cart', 'color': 'info'})
+    buttons_options.append({'label': '🏠 القائمة الرئيسية', 'value': 'home', 'color': 'secondary'})
 
     render_footer()
     
@@ -503,6 +508,8 @@ def user_shop():
     
     if act == 'home':
         main_menu()
+    elif act == 'cart':
+        view_cart()
     elif isinstance(act, str) and act.startswith('cart_'):
         add_to_cart(int(act.split('_')[1]))
 
