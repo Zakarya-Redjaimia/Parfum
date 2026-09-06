@@ -93,7 +93,7 @@ init_db()
 # --- Utility Functions ---
 
 def enable_password_toggle(input_names):
-    """Dynamically converts specified text inputs into password fields with a visibility toggle button."""
+    """Dynamically converts specified text inputs into password fields with a visibility toggle button labeling Seen/Unseen."""
     js_code = f"""
     setTimeout(() => {{
         const names = {input_names};
@@ -109,7 +109,7 @@ def enable_password_toggle(input_names):
 
                 const btn = document.createElement('span');
                 btn.className = 'pw-toggle-btn';
-                btn.innerText = '👁️';
+                btn.innerText = '👁️ Seen';
                 btn.style.position = 'absolute';
                 btn.style.left = '10px';
                 btn.style.top = '50%';
@@ -117,14 +117,18 @@ def enable_password_toggle(input_names):
                 btn.style.cursor = 'pointer';
                 btn.style.userSelect = 'none';
                 btn.style.zIndex = '10';
+                btn.style.fontSize = '12px';
+                btn.style.padding = '2px 6px';
+                btn.style.background = '#edf2f7';
+                btn.style.borderRadius = '4px';
 
                 btn.onclick = () => {{
                     if (inputElem.type === 'password') {{
                         inputElem.type = 'text';
-                        btn.innerText = '🙈';
+                        btn.innerText = '🙈 Unseen';
                     }} else {{
                         inputElem.type = 'password';
-                        btn.innerText = '👁️';
+                        btn.innerText = '👁️ Seen';
                     }}
                 }};
                 inputElem.after(btn);
