@@ -32,7 +32,10 @@ STORE_EMAIL = "contact@luxuryimpactparfum.com"
 STORE_WEBSITE = "https://rzparfum.onrender.com/"
 DB_EXPORT_SECRET = os.environ.get("DB_EXPORT_SECRET", "super-secret-passphrase-rz")
 
+# Ensure persistent path for hosting platforms (e.g. /var/data on Render)
 DATA_DIR = Path(os.environ.get("RENDER_DISK_PATH", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 DB_NAME = DATA_DIR / "shop_db.sqlite"
 UPLOAD_DIR = DATA_DIR / "static" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -94,7 +97,6 @@ init_db()
 # --- Utility Functions ---
 
 def enable_password_toggle(input_names):
-    """Dynamically converts specified text inputs into password fields with a visibility toggle button labeling Seen/Unseen."""
     js_code = f"""
     setTimeout(() => {{
         const names = {input_names};
@@ -189,7 +191,7 @@ def admin_exists():
         cursor.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
         return cursor.fetchone() is not None
 
-# --- Session Persistence & Controls ---
+# --- Session Persistence ---
 
 def get_current_user():
     return getattr(session_local, 'user', None)
@@ -202,7 +204,6 @@ def set_current_user(user_dict):
         run_js("window.localStorage.removeItem('user_session_id');")
 
 def sync_session():
-    """Restores session from browser local storage reliably on refresh/page load."""
     if get_current_user():
         return True
     try:
@@ -302,7 +303,7 @@ def render_footer():
         </div>
     """)
 
-# --- Main Views & Flow Control ---
+# --- Main Views ---
 
 def main_menu():
     clear()
@@ -346,7 +347,7 @@ def main_menu():
         toast("تم تسجيل الخروج بنجاح.", color="info")
         main_menu()
 
-# --- Auth System ---
+# --- Auth Flow ---
 
 def register_page():
     clear()
@@ -424,13 +425,13 @@ def login_page():
         
         toast(f"مرحباً بك {user['name']}!", color="success")
         
-        # Directly redirect to the product showcase after login
+        # Directly redirect to shop catalog on login
         user_shop()
     else:
         toast("خطأ: بيانات الدخول أو كلمة المرور غير صحيحة!", color="error")
         login_page()
 
-# --- Market View ---
+# --- Market Catalog View ---
 
 def user_shop():
     clear()
@@ -485,9 +486,12 @@ def user_shop():
                 <div>
                     <img src="{img_src}" style="width: 100%; height: 180px; object-fit: cover; border-radius: 8px; margin-bottom: 10px;">
                     <h3 style="margin: 8px 0; font-size: 18px; color: #1a202c;">{name}</h3>
-                    <p style="color: #2b6cb0; font-weight: bold; font-size: 16px; margin: 5px 0;">
+                    
+                    <!-- Updated Price Color to Dark Yellow/Gold (#d69e2e) -->
+                    <p style="color: #d69e2e; font-weight: bold; font-size: 18px; margin: 5px 0;">
                         {disp_price:,.2f} {curr_info['symbol']}
                     </p>
+                    
                     <a href="{search_url}" target="_blank" class="ingredient-link" style="display: inline-block; margin: 5px 0;">🔍 المكونات</a>
                     <div style="width: 75px; height: 75px; margin: 10px auto;">{qr_svg}</div>
                 </div>
@@ -593,9 +597,11 @@ def view_cart():
             ])
 
         put_table(table_data)
+        
+        # Yellow price display for the cart total
         put_html(f"""
             <div style="background: #ffffff; padding: 20px; border-radius: 12px; margin: 20px auto; max-width: 400px; text-align: center;">
-                <h3 style="margin: 0;">المبلغ الإجمالي: <span style="color: #38a169;">{grand_total:,.2f} {curr_info['symbol']}</span></h3>
+                <h3 style="margin: 0;">المبلغ الإجمالي: <span style="color: #d69e2e; font-size: 22px;">{grand_total:,.2f} {curr_info['symbol']}</span></h3>
             </div>
         """)
 
@@ -684,7 +690,7 @@ def generate_pdf_invoice():
     download("Invoice_Parfum_RZ.pdf", buffer.getvalue())
     toast("تم تحميل الفاتورة بنجاح!", color="success")
 
-# --- Protected Admin Dashboard ---
+# --- Admin Portal ---
 
 @require_admin
 def download_database():
@@ -836,20 +842,19 @@ def edit_product_page(product_id):
     toast("تم تحديث بيانات العطر بنجاح!", color="success")
     list_products_page()
 
-# --- Application Entry Point ---
+# --- Entry Point ---
 
 def app_main():
     sync_session()
     restore_currency()
     main_menu()
 
-# --- WSGI App & Export Endpoint ---
-
 app = Flask(__name__)
 app.add_url_rule('/', 'webio_view', webio_view(app_main), methods=['GET', 'POST', 'OPTIONS'])
 
 @app.route('/healthz', methods=['GET'])
 def health_check():
+    """Keep-alive endpoint for uptime monitors."""
     return jsonify({"status": "ok", "timestamp": time.time()}), 200
 
 @app.route('/static/uploads/<filename>')
